@@ -32,26 +32,27 @@ constexpr void activate_states(G &g, int &output, std::index_sequence<Ss...>) {
 }
 
 template <std::size_t N, typename G, std::size_t... Cs>
-constexpr bool select_connection(G &g, std::size_t current, int &output,
-                                 std::index_sequence<Cs...>) {
+constexpr bool select_connection(
+  G &g, std::size_t current, int &output, std::index_sequence<Cs...>) {
   // A runtime index dispatches to compile-time state lookups. No match means
   // no side effects; only the selected connection's states are activated.
   return ((current == Cs &&
-           (activate_states<N, Cs>(g, output,
-                std::make_index_sequence<
-                    G::template get_connection_state_count<N, Cs>()>{}), true)) || ...);
+            (activate_states<N, Cs>(g, output,
+               std::make_index_sequence<
+                 G::template get_connection_state_count<N, Cs>()>{}),
+              true)) ||
+    ...);
 }
 
 template <std::size_t N, typename G>
 constexpr bool set_current_connection(G &g, std::size_t current, int &output) {
   return select_connection<N>(g, current, output,
-      std::make_index_sequence<G::template get_connection_count<N>()>{});
+    std::make_index_sequence<G::template get_connection_count<N>()>{});
 }
 
 constexpr bool test_activation() {
-  sg::graph g{sg::node{},
-              sg::connection<>{}, activation_state{2}, activation_state{3},
-              sg::connection<>{}, activation_state{10}};
+  sg::graph g{sg::node{}, sg::connection<>{}, activation_state{2},
+    activation_state{3}, sg::connection<>{}, activation_state{10}};
   int output = 0;
   if (!set_current_connection<0>(g, 1, output) || output != 10)
     return false;
@@ -63,8 +64,8 @@ constexpr bool test_activation() {
   if (set_current_connection<0>(g, 2, output) || output != 20)
     return false;
   return g.get_connection_state<0, 0, 0>()->activations == 1 &&
-         g.get_connection_state<0, 0, 1>()->activations == 1 &&
-         g.get_connection_state<0, 1, 0>()->activations == 1;
+    g.get_connection_state<0, 0, 1>()->activations == 1 &&
+    g.get_connection_state<0, 1, 0>()->activations == 1;
 }
 static_assert(test_activation());
 

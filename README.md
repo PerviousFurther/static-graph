@@ -147,3 +147,15 @@ For example:
 g++ -std=c++20 example/connection_activation.cpp -o connection_activation
 ./connection_activation
 ```
+
+## Code style
+
+Use the repository's `.clang-format`: LLVM-based, two-space indentation and
+continuation indentation, with `DontAlign` for bracket continuations and
+operands. Consecutive assignments, declarations, and trailing comments are not
+column-aligned. Formatting is verified with clang-format 18.1.8.
+
+```sh
+clang-format -i inc/graph.hpp example/*.cpp tests/*.cpp
+clang-format --dry-run --Werror inc/graph.hpp example/*.cpp tests/*.cpp
+```
