@@ -20,6 +20,54 @@ struct type_list_at<0u, type_list<T, Ts...>> {
   using type = T;
 };
 
+template <typename List> struct type_list_size;
+template <typename... Ts>
+struct type_list_size<type_list<Ts...>>
+    : std::integral_constant<std::size_t, sizeof...(Ts)> {};
+
+template <typename... Lists> struct type_list_cat {
+  using type = type_list<>;
+};
+template <typename... Ts> struct type_list_cat<type_list<Ts...>> {
+  using type = type_list<Ts...>;
+};
+template <typename... As, typename... Bs, typename... Rest>
+struct type_list_cat<type_list<As...>, type_list<Bs...>, Rest...>
+    : type_list_cat<type_list<As..., Bs...>, Rest...> {};
+
+// Keeps the first occurrence of each type.
+template <typename List, typename Out = type_list<>> struct type_list_unique {
+  using type = Out;
+};
+template <typename T, typename... Ts, typename... Os>
+struct type_list_unique<type_list<T, Ts...>, type_list<Os...>>
+    : type_list_unique<type_list<Ts...>,
+        std::conditional_t<(std::is_same_v<T, Os> || ...), type_list<Os...>,
+          type_list<Os..., T>>> {};
+
+template <template <typename...> class F, typename List> struct type_list_apply;
+template <template <typename...> class F, typename... Ts>
+struct type_list_apply<F, type_list<Ts...>> {
+  using type = F<Ts...>;
+};
+
+// A descriptor whose apply<As...> is F<As..., Bs...>.
+template <template <typename...> class F, typename... Bs>
+struct type_bind_back {
+  template <typename... As> using apply = F<As..., Bs...>;
+};
+
+// Applies descriptors in order: apply_each_t<T, A, B> is
+// B::apply<A::apply<T>>.
+template <typename T, typename... Ds> struct apply_each {
+  using type = T;
+};
+template <typename T, typename D, typename... Ds>
+struct apply_each<T, D, Ds...>
+    : apply_each<typename D::template apply<T>, Ds...> {};
+template <typename T, typename... Ds>
+using apply_each_t = typename apply_each<T, Ds...>::type;
+
 // Derived is optional: node{} remains a no-op node.
 // A custom node should use base node::apply<T, apply<T>> so get_node returns
 // the concrete node layer.
@@ -27,14 +75,12 @@ struct node {
   template <typename T, typename Derived = void> struct apply : T {
     using node_tag = void;
     using self_type =
-        std::conditional_t<std::is_void_v<Derived>, apply, Derived>;
+      std::conditional_t<std::is_void_v<Derived>, apply, Derived>;
 
     template <typename... Args>
-    constexpr apply(node, Args &&...args)
-        : T{std::forward<Args>(args)...} {}
+    constexpr apply(node, Args &&...args) : T{std::forward<Args>(args)...} {}
     template <typename... Args>
-    constexpr apply(Args &&...args)
-        : T{std::forward<Args>(args)...} {}
+    constexpr apply(Args &&...args) : T{std::forward<Args>(args)...} {}
 
     template <typename... Args>
     constexpr void execute(Args &&...) const noexcept {}
@@ -50,11 +96,11 @@ struct node {
     }();
 
     constexpr self_type *get_node(std::in_place_index_t<node_index>) noexcept {
-      return static_cast<self_type *>(this); // MSVC have bug here when in consteval.
+      return static_cast<self_type*>(this); // MSVC have bug here when in consteval.
     }
-    constexpr const self_type *
-    get_node(std::in_place_index_t<node_index>) const noexcept {
-      return static_cast<const self_type *>(this); // MSVC have bug here when in consteval.
+    constexpr const self_type *get_node(
+      std::in_place_index_t<node_index>) const noexcept {
+      return static_cast<const self_type*>(this); // MSVC have bug here when in consteval.
     }
   };
 };
@@ -66,7 +112,7 @@ template <std::size_t... indices> struct connection {
   template <typename T> struct apply : T {
     template <typename... Args>
     constexpr apply(connection, Args &&...args)
-      : T{std::forward<Args>(args)...} {}
+        : T{std::forward<Args>(args)...} {}
 
   protected:
     using T::get_connection_count;
@@ -91,141 +137,163 @@ template <std::size_t... indices> struct connection {
       return get_connection_impl(T::get_connection());
     }
 
-    static constexpr std::size_t
-    get_connection_count(std::in_place_index_t<last_connection_node_index>) noexcept {
+    static constexpr std::size_t get_connection_count(
+      std::in_place_index_t<last_connection_node_index>) noexcept {
       return connection_index + 1;
     }
 
-    static constexpr auto
-    get_connection_indices(std::in_place_index_t<last_connection_node_index>,
-                           std::in_place_index_t<connection_index>) noexcept {
+    static constexpr auto get_connection_indices(
+      std::in_place_index_t<last_connection_node_index>,
+      std::in_place_index_t<connection_index>) noexcept {
       return std::index_sequence<indices...>{};
     }
 
   private:
     template <typename... Qs>
     static constexpr auto get_connection_impl(type_list<Qs...>) noexcept
-      requires(!last_is_same_connection) {
-      return type_list<std::index_sequence<last_connection_node_index, indices...>, Qs...>{};
+      requires(!last_is_same_connection)
+    {
+      return type_list<
+        std::index_sequence<last_connection_node_index, indices...>, Qs...>{};
     }
 
     template <std::size_t... ids, typename... Qs>
-    static constexpr auto
-    get_connection_impl(type_list<std::index_sequence<ids...>, Qs...>) noexcept
-      requires(last_is_same_connection) {
+    static constexpr auto get_connection_impl(
+      type_list<std::index_sequence<ids...>, Qs...>) noexcept
+      requires(last_is_same_connection)
+    {
       return type_list<std::index_sequence<ids..., indices...>, Qs...>{};
     }
   };
 };
 
-// A connection state belongs to the most recent connection on the current
-// node. Custom descriptors derive from apply<T, apply<T>>, just like state.
-// It supplies indexing and lookup only; behavior belongs to custom descriptors.
-struct connection_state {
-  template <typename T, typename Derived = void> struct apply : T {
-    using self_type =
-        std::conditional_t<std::is_void_v<Derived>, apply, Derived>;
+namespace detail {
+template <typename T, typename Derived> struct node_state;
+template <typename T, typename Derived> struct connection_state;
 
-    template <typename... Args>
-    constexpr apply(connection_state, Args &&...args)
-        : T{std::forward<Args>(args)...} {}
-    template <typename... Args>
-    constexpr apply(Args &&...args)
-        : T{std::forward<Args>(args)...} {}
-
-  protected:
-    using T::get_connection_state;
-    using T::get_connection_state_count;
-
-    static_assert([] {
-      if constexpr (requires { T::last_connection_node_index; T::node_index; })
-        return T::last_connection_node_index == T::node_index;
-      else
-        return false;
-    }(), "connection_state must follow a connection on the current node");
-
-    static constexpr auto last_connection_state_node_index = T::node_index;
-    static constexpr auto last_connection_state_connection_index = T::connection_index;
-    static constexpr std::size_t connection_state_index = [] {
-      if constexpr (requires { T::connection_state_index; }) {
-        if constexpr (T::last_connection_state_node_index == T::node_index &&
-                      T::last_connection_state_connection_index == T::connection_index)
-          return T::connection_state_index + 1;
-      }
-      return std::size_t{0};
-    }();
-
-    static constexpr std::size_t
-    get_connection_state_count(
-        std::in_place_index_t<last_connection_state_node_index>,
-        std::in_place_index_t<last_connection_state_connection_index>) noexcept {
-      return connection_state_index + 1;
-    }
-
-    constexpr self_type *get_connection_state(
-        std::in_place_index_t<last_connection_state_node_index>,
-        std::in_place_index_t<last_connection_state_connection_index>,
-        std::in_place_index_t<connection_state_index>) noexcept {
-      return static_cast<self_type *>(this);
-    }
-    constexpr const self_type *get_connection_state(
-        std::in_place_index_t<last_connection_state_node_index>,
-        std::in_place_index_t<last_connection_state_connection_index>,
-        std::in_place_index_t<connection_state_index>) const noexcept {
-      return static_cast<const self_type *>(this);
-    }
-  };
+// Whether the layers in T have already declared a connection on their node.
+// The indices are protected, so the check reads them from a derived class.
+template <typename T> struct has_connection : T {
+  static constexpr bool value = [] {
+    if constexpr (requires {
+                    T::node_index;
+                    T::last_connection_node_index;
+                  })
+      return T::last_connection_node_index == T::node_index;
+    else
+      return false;
+  }();
 };
+} // namespace detail
 
+// A state belongs to the current node until the node's first connection, and
+// to the node's last connection after it. Custom states derive from
+// state::apply<T, apply<T>>.
 struct state {
-  template <typename T, typename Derived = void> struct apply : T {
-    using self_type =
-        std::conditional_t<std::is_void_v<Derived>, apply, Derived>;
-
-    template <typename... Args>
-    constexpr apply(state, Args &&...args)
-      : T{std::forward<Args>(args)...} {}
-    template <typename...Args>
-    constexpr apply(Args &&...args) 
-      : T{std::forward<Args>(args)...} {}
-
-  protected:
-    using T::get_state;
-    using T::get_state_count;
-
-    static constexpr auto last_state_node_index = T::node_index;
-    static constexpr bool last_is_same_state = []() constexpr {
-      if constexpr (requires { T::state_index; })
-        return T::last_state_node_index == last_state_node_index;
-      else
-        return false;
-    }();
-    static constexpr std::size_t state_index = []() constexpr {
-      if constexpr (last_is_same_state)
-        return T::state_index + 1;
-      else
-        return std::size_t{0};
-    }();
-
-    static constexpr std::size_t
-    get_state_count(std::in_place_index_t<last_state_node_index>) noexcept {
-      return state_index + 1;
-    }
-
-    constexpr self_type *
-    get_state(std::in_place_index_t<last_state_node_index>,
-      std::in_place_index_t<state_index>) noexcept {
-      return static_cast<self_type *>(
-          this); // MSVC have bug here when in consteval.
-    }
-    constexpr self_type const *
-    get_state(std::in_place_index_t<last_state_node_index>, 
-      std::in_place_index_t<state_index>) const noexcept {
-      return static_cast<self_type const *>(
-          this); // MSVC have bug here when in consteval.
-    }
-  };
+  template <typename T, typename Derived = void>
+  using apply = std::conditional_t<detail::has_connection<T>::value,
+    detail::connection_state<T, Derived>, detail::node_state<T, Derived>>;
 };
+
+namespace detail {
+// A state before the current node's first connection belongs to the node and
+// is passed to its execute.
+template <typename T, typename Derived> struct node_state : T {
+  using self_type =
+    std::conditional_t<std::is_void_v<Derived>, node_state, Derived>;
+
+  template <typename... Args>
+  constexpr node_state(state, Args &&...args)
+      : T{std::forward<Args>(args)...} {}
+  template <typename... Args>
+  constexpr node_state(Args &&...args) : T{std::forward<Args>(args)...} {}
+
+protected:
+  static_assert(requires { T::node_index; }, "state must follow a node");
+
+  using T::get_state;
+  using T::get_state_count;
+
+  static constexpr auto last_state_node_index = T::node_index;
+  static constexpr bool last_is_same_state = []() constexpr {
+    if constexpr (requires { T::state_index; })
+      return T::last_state_node_index == last_state_node_index;
+    else
+      return false;
+  }();
+  static constexpr std::size_t state_index = []() constexpr {
+    if constexpr (last_is_same_state)
+      return T::state_index + 1;
+    else
+      return std::size_t{0};
+  }();
+
+  static constexpr std::size_t get_state_count(
+    std::in_place_index_t<last_state_node_index>) noexcept {
+    return state_index + 1;
+  }
+
+  constexpr self_type *get_state(std::in_place_index_t<last_state_node_index>,
+    std::in_place_index_t<state_index>) noexcept {
+    return static_cast<self_type *>(
+      this); // MSVC have bug here when in consteval.
+  }
+  constexpr self_type const *get_state(
+    std::in_place_index_t<last_state_node_index>,
+    std::in_place_index_t<state_index>) const noexcept {
+    return static_cast<self_type const *>(
+      this); // MSVC have bug here when in consteval.
+  }
+};
+
+// A state after a connection belongs to the current node's last connection.
+// It supplies indexing and lookup only; behavior belongs to custom states.
+template <typename T, typename Derived> struct connection_state : T {
+  using self_type =
+    std::conditional_t<std::is_void_v<Derived>, connection_state, Derived>;
+
+  template <typename... Args>
+  constexpr connection_state(state, Args &&...args)
+      : T{std::forward<Args>(args)...} {}
+  template <typename... Args>
+  constexpr connection_state(Args &&...args) : T{std::forward<Args>(args)...} {}
+
+protected:
+  using T::get_connection_state;
+  using T::get_connection_state_count;
+
+  static constexpr auto last_connection_state_node_index = T::node_index;
+  static constexpr auto last_connection_state_connection_index =
+    T::connection_index;
+  static constexpr std::size_t connection_state_index = [] {
+    if constexpr (requires { T::connection_state_index; }) {
+      if constexpr (T::last_connection_state_node_index == T::node_index &&
+        T::last_connection_state_connection_index == T::connection_index)
+        return T::connection_state_index + 1;
+    }
+    return std::size_t{0};
+  }();
+
+  static constexpr std::size_t get_connection_state_count(
+    std::in_place_index_t<last_connection_state_node_index>,
+    std::in_place_index_t<last_connection_state_connection_index>) noexcept {
+    return connection_state_index + 1;
+  }
+
+  constexpr self_type *get_connection_state(
+    std::in_place_index_t<last_connection_state_node_index>,
+    std::in_place_index_t<last_connection_state_connection_index>,
+    std::in_place_index_t<connection_state_index>) noexcept {
+    return static_cast<self_type *>(this);
+  }
+  constexpr const self_type *get_connection_state(
+    std::in_place_index_t<last_connection_state_node_index>,
+    std::in_place_index_t<last_connection_state_connection_index>,
+    std::in_place_index_t<connection_state_index>) const noexcept {
+    return static_cast<const self_type *>(this);
+  }
+};
+} // namespace detail
 
 // Optional owning-state example. Use an explicit std::reference_wrapper<V>
 // as V when borrowing is intended; its referent must outlive graph execution.
@@ -238,17 +306,17 @@ template <typename V> struct value_state {
 
     template <typename... Args>
     constexpr apply(value_state s, Args &&...args)
-      : base{state{}, std::forward<Args>(args)...},
-        value(std::move(s.value)) {}
+        : base{state{}, std::forward<Args>(args)...},
+          value(std::move(s.value)) {}
   };
 };
 template <typename V> value_state(V &&) -> value_state<std::remove_cvref_t<V>>;
 
 namespace detail {
 
-template <typename... Ts> struct adopt;
-template <> struct adopt<> {
-  constexpr adopt() = default;
+// Bottom of every graph: lookups that reach it are out of range.
+struct root {
+  constexpr root() = default;
 
   void get_node(...) const = delete;
   void get_state(...) const = delete;
@@ -257,50 +325,31 @@ template <> struct adopt<> {
   static void get_connection_indices(...) = delete;
 
   template <std::size_t N>
-  static constexpr std::size_t
-  get_connection_count(std::in_place_index_t<N>) noexcept {
+  static constexpr std::size_t get_connection_count(
+    std::in_place_index_t<N>) noexcept {
     return 0;
   }
 
   template <std::size_t N, std::size_t C>
-  static constexpr std::size_t
-  get_connection_state_count(std::in_place_index_t<N>,
-                             std::in_place_index_t<C>) noexcept {
+  static constexpr std::size_t get_connection_state_count(
+    std::in_place_index_t<N>, std::in_place_index_t<C>) noexcept {
     return 0;
   }
 
   template <std::size_t N>
-  static constexpr std::size_t
-  get_state_count(std::in_place_index_t<N>) noexcept {
+  static constexpr std::size_t get_state_count(
+    std::in_place_index_t<N>) noexcept {
     return 0;
   }
 };
-template <typename T, typename... Ts>
-struct adopt<T, Ts...> : T::template apply<adopt<Ts...>> {
-  using base = typename T::template apply<adopt<Ts...>>;
-
-  template <typename... Args>
-  constexpr adopt(Args &&...args)
-      : base{std::forward<Args>(args)...} {}
-};
-
 template <std::size_t N, std::size_t... Is>
-constexpr std::index_sequence<(N - 1 - Is)...>
-reverse_indices(std::index_sequence<Is...>) {
+constexpr std::index_sequence<(N - 1 - Is)...> reverse_indices(
+  std::index_sequence<Is...>) {
   return {};
 };
 template <std::size_t N>
 using make_reverse_index_sequence =
   decltype(reverse_indices<N>(std::make_index_sequence<N>{}));
-
-template <typename Tuple, typename Indices> struct reverse_adopt_impl;
-template <typename Tuple, std::size_t... Is>
-struct reverse_adopt_impl<Tuple, std::index_sequence<Is...>> {
-  using type = adopt<std::tuple_element_t<Is, Tuple>...>;
-};
-template <typename... Ts>
-using reverse_adopt = typename reverse_adopt_impl<
-    ::std::tuple<Ts...>, make_reverse_index_sequence<sizeof...(Ts)>>::type;
 
 // Composition deliberately keeps child node/state indices local to the child.
 template <typename G, typename T>
@@ -312,22 +361,17 @@ struct graph_node : node::apply<T, graph_node<G, T>> {
   constexpr graph_node(G g, Args &&...args)
       : base{node{}, std::forward<Args>(args)...}, value(std::move(g)) {}
 
-  template <typename... States>
-  constexpr void execute(States &...states) 
-  {
+  template <typename... States> constexpr void execute(States &...states) {
     value.execute(states...);
   }
   template <typename... States>
-  constexpr void execute(States &...states) const
-  {
+  constexpr void execute(States &...states) const {
     value.execute(states...);
   }
-  template <std::size_t index>
-  constexpr auto get_node() noexcept {
+  template <std::size_t index> constexpr auto get_node() noexcept {
     return value.template get_node<index>();
   }
-  template <std::size_t index>
-  constexpr auto get_node() const noexcept {
+  template <std::size_t index> constexpr auto get_node() const noexcept {
     return value.template get_node<index>();
   }
   template <std::size_t node_index, std::size_t state_index>
@@ -362,18 +406,20 @@ struct graph_node : node::apply<T, graph_node<G, T>> {
 
 protected:
   // Keep the outer graph's indexed lookup overloads visible.
-  using base::get_node;
-  using base::get_state;
-  using base::get_connection_state;
   using base::get_connection_count;
   using base::get_connection_indices;
+  using base::get_connection_state;
   using base::get_connection_state_count;
+  using base::get_node;
+  using base::get_state;
 };
 
 } // namespace detail
 
-template <typename... Ts> struct graph : detail::reverse_adopt<Ts...> {
-  using base = detail::reverse_adopt<Ts...>;
+// The first descriptor is applied first, so it is the innermost base; the
+// constructor receives the outermost descriptor's argument first.
+template <typename... Ts> struct graph : apply_each_t<detail::root, Ts...> {
+  using base = apply_each_t<detail::root, Ts...>;
 
 private:
   template <std::size_t... Is, typename Tuple>
@@ -390,34 +436,37 @@ public:
 
   template <typename... Args>
     requires(sizeof...(Args) == sizeof...(Ts) &&
-             (std::is_same_v<std::remove_cvref_t<Args>, Ts> && ...))
+      (std::is_same_v<std::remove_cvref_t<Args>, Ts> && ...))
   constexpr graph(Args &&...args)
-    : graph(detail::make_reverse_index_sequence<sizeof...(Args)>{}
-      , std::forward_as_tuple(std::forward<Args>(args)...)) {}
+      : graph(detail::make_reverse_index_sequence<sizeof...(Args)>{},
+          std::forward_as_tuple(std::forward<Args>(args)...)) {}
 
-  template <std::size_t I>
-  constexpr auto get_node() noexcept {
-    static_assert(requires { base::get_node(std::in_place_index<I>); },
-                  "graph: node index out of range");
+  template <std::size_t I> constexpr auto get_node() noexcept {
+    static_assert(
+      requires { base::get_node(std::in_place_index<I>); },
+      "graph: node index out of range");
     return base::get_node(std::in_place_index<I>);
   }
-  template <std::size_t I>
-  constexpr auto get_node() const noexcept {
-    static_assert(requires { base::get_node(std::in_place_index<I>); },
-                  "graph: node index out of range");
+  template <std::size_t I> constexpr auto get_node() const noexcept {
+    static_assert(
+      requires { base::get_node(std::in_place_index<I>); },
+      "graph: node index out of range");
     return base::get_node(std::in_place_index<I>);
   }
 
-  template <std::size_t N, std::size_t S>
-  constexpr auto get_state() noexcept {
-    static_assert(requires { base::get_state(std::in_place_index<N>, std::in_place_index<S>); },
-                  "graph: state index out of range");
+  template <std::size_t N, std::size_t S> constexpr auto get_state() noexcept {
+    static_assert(
+      requires {
+        base::get_state(std::in_place_index<N>, std::in_place_index<S>);
+      }, "graph: state index out of range");
     return base::get_state(std::in_place_index<N>, std::in_place_index<S>);
   }
   template <std::size_t N, std::size_t S>
   constexpr auto get_state() const noexcept {
-    static_assert(requires { base::get_state(std::in_place_index<N>, std::in_place_index<S>); },
-                  "graph: state index out of range");
+    static_assert(
+      requires {
+        base::get_state(std::in_place_index<N>, std::in_place_index<S>);
+      }, "graph: state index out of range");
     return base::get_state(std::in_place_index<N>, std::in_place_index<S>);
   }
 
@@ -439,40 +488,40 @@ public:
 
   template <std::size_t N, std::size_t C>
   static constexpr auto get_connection_indices() noexcept {
-    static_assert(C < get_connection_count<N>(),
-                  "graph: connection index out of range");
-    return base::get_connection_indices(std::in_place_index<N>,
-                                       std::in_place_index<C>);
+    static_assert(
+      C < get_connection_count<N>(), "graph: connection index out of range");
+    return base::get_connection_indices(
+      std::in_place_index<N>, std::in_place_index<C>);
   }
 
   template <std::size_t N, std::size_t C>
   static constexpr std::size_t get_connection_state_count() noexcept {
-    static_assert(C < get_connection_count<N>(),
-                  "graph: connection index out of range");
-    return base::get_connection_state_count(std::in_place_index<N>,
-                                            std::in_place_index<C>);
+    static_assert(
+      C < get_connection_count<N>(), "graph: connection index out of range");
+    return base::get_connection_state_count(
+      std::in_place_index<N>, std::in_place_index<C>);
   }
 
   template <std::size_t N, std::size_t C, std::size_t S>
   constexpr auto get_connection_state() noexcept {
     static_assert(S < get_connection_state_count<N, C>(),
-                  "graph: connection state index out of range");
-    return base::get_connection_state(std::in_place_index<N>,
-                                      std::in_place_index<C>, std::in_place_index<S>);
+      "graph: connection state index out of range");
+    return base::get_connection_state(
+      std::in_place_index<N>, std::in_place_index<C>, std::in_place_index<S>);
   }
   template <std::size_t N, std::size_t C, std::size_t S>
   constexpr auto get_connection_state() const noexcept {
     static_assert(S < get_connection_state_count<N, C>(),
-                  "graph: connection state index out of range");
-    return base::get_connection_state(std::in_place_index<N>,
-                                      std::in_place_index<C>, std::in_place_index<S>);
+      "graph: connection state index out of range");
+    return base::get_connection_state(
+      std::in_place_index<N>, std::in_place_index<C>, std::in_place_index<S>);
   }
 
 private:
   // Do not accidentally expose execute inherited from the last node layer.
   void execute(...) const = delete;
 };
-template <typename...Ts> graph(Ts&&...) -> graph<std::remove_cvref_t<Ts>...>;
+template <typename... Ts> graph(Ts &&...) -> graph<std::remove_cvref_t<Ts>...>;
 
 namespace detail {
 
@@ -495,8 +544,8 @@ consteval auto make_plan(type_list<Groups...>) noexcept {
   constexpr auto edge_count = ((Groups::size() - 1) + ... + std::size_t(0));
   std::array<edge, edge_count> edges{};
   std::size_t offset = 0;
-  [[maybe_unused]] auto add_group 
-    = [&]<std::size_t To, std::size_t... From>(std::index_sequence<To, From...>) {
+  [[maybe_unused]] auto add_group = [&]<std::size_t To, std::size_t... From>(
+                                      std::index_sequence<To, From...>) {
     ((edges[offset++] = edge{From, To}), ...);
   };
   (add_group(Groups{}), ...);
@@ -542,14 +591,18 @@ consteval auto make_plan(type_list<Groups...>) noexcept {
 }
 
 template <std::size_t I, typename G, std::size_t... Ss, typename... States>
-constexpr void execute_node(G &g, std::index_sequence<Ss...>, States &...states) {
-  g.template get_node<I>()
-    ->execute(states..., *g.template get_state<I, Ss>()...);
+constexpr void execute_node(
+  G &g, std::index_sequence<Ss...>, States &...states) {
+  g.template get_node<I>()->execute(
+    states..., *g.template get_state<I, Ss>()...);
 }
 
 template <typename G, std::size_t... Is, typename... States>
-constexpr void execute_graph(G &g, std::index_sequence<Is...>, States &...states) {
-  (static_cast<void>(execute_node<Is>(g, std::make_index_sequence<G::template get_state_count<Is>()>{}, states...)), ...);
+constexpr void execute_graph(
+  G &g, std::index_sequence<Is...>, States &...states) {
+  (static_cast<void>(execute_node<Is>(g,
+     std::make_index_sequence<G::template get_state_count<Is>()>{}, states...)),
+    ...);
 }
 
 } // namespace detail
@@ -564,29 +617,32 @@ template <class... Ts> struct exec_graph : graph<Ts...> {
 
 private:
   static constexpr auto plan =
-      detail::make_plan<base::node_count>(base::get_connection());
-  static_assert(plan.valid_indices,
-                "exec_graph: connection index out of range");
+    detail::make_plan<base::node_count>(base::get_connection());
+  static_assert(
+    plan.valid_indices, "exec_graph: connection index out of range");
   static_assert(plan.acyclic, "exec_graph: cyclic dependency");
 
   template <std::size_t... Is>
-  static constexpr auto make_order(std::index_sequence<Is...>)
-      -> std::index_sequence<plan.order[Is]...> { return {}; }
+  static constexpr auto make_order(
+    std::index_sequence<Is...>) -> std::index_sequence<plan.order[Is]...> {
+    return {};
+  }
 
 public:
-  using order_type = decltype(make_order(std::make_index_sequence<base::node_count>{}));
+  using order_type =
+    decltype(make_order(std::make_index_sequence<base::node_count>{}));
   static consteval order_type get_order() noexcept { return {}; }
 
-  template <typename... States>
-  constexpr void execute(States &...states) {
+  template <typename... States> constexpr void execute(States &...states) {
     detail::execute_graph(static_cast<base &>(*this), get_order(), states...);
   }
   template <typename... States>
   constexpr void execute(States &...states) const {
-    detail::execute_graph(static_cast<const base &>(*this), get_order(), states...);
+    detail::execute_graph(
+      static_cast<const base &>(*this), get_order(), states...);
   }
 };
 template <class... Ts>
 exec_graph(Ts &&...) -> exec_graph<std::remove_cvref_t<Ts>...>;
 
-}
+} // namespace sg

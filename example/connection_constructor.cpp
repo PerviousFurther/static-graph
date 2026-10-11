@@ -19,20 +19,19 @@ struct parameter_node {
 struct constructor_state {
   int initial;
 
-  template <typename T>
-  struct apply : sg::connection_state::apply<T, apply<T>> {
-    using base = typename sg::connection_state::template apply<T, apply<T>>;
+  template <typename T> struct apply : sg::state::apply<T, apply<T>> {
+    using base = typename sg::state::template apply<T, apply<T>>;
 
     template <std::size_t... Is, typename... Args>
-    constexpr apply(constructor_state s, sg::connection<Is...> c, Args &&...args)
-        : base{sg::connection_state{}, c, s.initial,
-               std::forward<Args>(args)...} {}
+    constexpr apply(
+      constructor_state s, sg::connection<Is...> c, Args &&...args)
+        : base{sg::state{}, c, s.initial, std::forward<Args>(args)...} {}
   };
 };
 
 constexpr bool test_constructor_arguments() {
   sg::graph g{parameter_node{}, sg::connection<>{}, constructor_state{42},
-              parameter_node{}, sg::connection<0>{}, constructor_state{7}};
+    parameter_node{}, sg::connection<0>{}, constructor_state{7}};
   return g.get_node<0>()->value == 42 && g.get_node<1>()->value == 7;
 }
 static_assert(test_constructor_arguments());

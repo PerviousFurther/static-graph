@@ -57,10 +57,10 @@ int main() {
   // Child and parent own separate local logs; share one trace for total order.
   trace log;
   exec_graph child{record_node<10>{}, value_state{0}, connection<1>{},
-                   record_node<11>{}, value_state{0}};
-  exec_graph g{record_node<0>{}, value_state{0},  std::move(child),
-               value_state{100}, connection<0>{}, record_node<2>{},
-               value_state{0},   connection<1>{}};
+    record_node<11>{}, value_state{0}};
+  exec_graph g{record_node<0>{}, value_state{0}, std::move(child),
+    value_state{100}, connection<0>{}, record_node<2>{}, value_state{0},
+    connection<1>{}};
   g.execute(log);
   for (std::size_t i = 0; i < log.record_count; ++i)
     std::cout << (i == 0 ? "" : " ") << log.ids[i];
@@ -74,6 +74,6 @@ int main() {
   assert((g.get_state<2, 0>()->value == 1));
   assert(log.record_count == 4);
   assert((log.ids[0] == 0 && log.ids[1] == 11 && log.ids[2] == 10 &&
-          log.ids[3] == 2));
+    log.ids[3] == 2));
   return 0;
 }

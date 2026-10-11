@@ -17,25 +17,25 @@ struct configured_node {
 };
 
 struct forwarding_state {
-  template <typename T>
-  struct apply : sg::connection_state::apply<T, apply<T>> {
-    using base = typename sg::connection_state::template apply<T, apply<T>>;
+  template <typename T> struct apply : sg::state::apply<T, apply<T>> {
+    using base = typename sg::state::template apply<T, apply<T>>;
 
     template <typename... Args>
     constexpr apply(forwarding_state, Args &&...args)
-        : base{sg::connection_state{}, std::forward<Args>(args)...} {}
+        : base{sg::state{}, std::forward<Args>(args)...} {}
 
     constexpr void configure(int value) {
-      // These indices are supplied by connection_state's descriptor layer.
-      this->get_node(std::in_place_index<base::last_connection_state_node_index>)
-          ->set_value(value);
+      // These indices are supplied by the connection state layer.
+      this
+        ->get_node(std::in_place_index<base::last_connection_state_node_index>)
+        ->set_value(value);
     }
   };
 };
 
 constexpr bool test_function_arguments() {
   sg::graph g{configured_node{}, sg::connection<>{}, forwarding_state{},
-              configured_node{}, sg::connection<0>{}, forwarding_state{}};
+    configured_node{}, sg::connection<0>{}, forwarding_state{}};
   g.get_connection_state<0, 0, 0>()->configure(42);
   g.get_connection_state<1, 0, 0>()->configure(7);
   return g.get_node<0>()->value == 42 && g.get_node<1>()->value == 7;
