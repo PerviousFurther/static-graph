@@ -17,8 +17,13 @@
 // (when_all's children, schedule senders) is connected as a separate operation
 // held by its layer, with a receiver that calls back into that layer.
 //
+// Coroutines and senders meet in two places. An awaitable is a sender: connect
+// runs a small coroutine that awaits it. A sender is awaitable in a coroutine
+// whose promise uses as_awaitable (with_awaitable_senders, task): its
+// operation is connected into the awaiter, in the coroutine frame.
+//
 // Not provided: tag_invoke customization, domains and transform_sender,
-// sequence senders, coroutine integration.
+// sequence senders.
 //
 // Keep an operation alive until it completes. Receivers must be noexcept and
 // must consume their arguments before destroying the operation that sent them.
@@ -29,11 +34,13 @@
 #include <atomic>
 #include <concepts>
 #include <condition_variable>
+#include <coroutine>
 #include <cstddef>
 #include <exception>
 #include <execution>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -92,16 +99,6 @@ struct start_t {
   }
 };
 inline constexpr start_t start{};
-
-struct connect_t {
-  template <class S, class R>
-  constexpr auto operator()(S &&s, R &&r) const
-    noexcept(noexcept(std::forward<S>(s).connect(std::forward<R>(
-      r)))) -> decltype(std::forward<S>(s).connect(std::forward<R>(r))) {
-    return std::forward<S>(s).connect(std::forward<R>(r));
-  }
-};
-inline constexpr connect_t connect{};
 
 struct schedule_t {
   template <class Sch>
@@ -432,6 +429,92 @@ template <class Sch> struct sched_attrs {
 };
 } // namespace detail
 
+// ---- Awaitables and connect ---------------------------------------------
+
+namespace detail {
+// The operand of co_await after applying operator co_await, if any.
+template <class A> decltype(auto) co_await_operand(A &&a) {
+  if constexpr (requires { std::forward<A>(a).operator co_await(); })
+    return std::forward<A>(a).operator co_await();
+  else if constexpr (requires { operator co_await(std::forward<A>(a)); })
+    return operator co_await(std::forward<A>(a));
+  else
+    return std::forward<A>(a);
+}
+// The awaiter of co_await a in a coroutine whose promise is P.
+template <class A, class P> decltype(auto) get_awaiter(A &&a, P *p) {
+  if constexpr (requires { p->await_transform(std::forward<A>(a)); })
+    return co_await_operand(p->await_transform(std::forward<A>(a)));
+  else
+    return co_await_operand(std::forward<A>(a));
+}
+
+template <class W, class P>
+concept awaiter = requires(W &w, std::coroutine_handle<P> h) {
+  w.await_ready() ? 0 : 0;
+  w.await_suspend(h);
+  w.await_resume();
+};
+template <class A, class P>
+concept is_awaitable = requires(A &&a, P *p) {
+  { get_awaiter(std::forward<A>(a), p) } -> awaiter<P>;
+};
+template <class A, class P>
+using await_result_t =
+  decltype(std::declval<decltype(get_awaiter(
+             std::declval<A>(), static_cast<P *>(nullptr)))>()
+             .await_resume());
+
+// A promise without await_transform, for checking plain awaitables.
+struct plain_promise {};
+
+// Awaits what defines as_awaitable(promise) through it, the rest as is.
+template <class Promise> struct with_await_transform {
+  template <class A> decltype(auto) await_transform(A &&a) {
+    if constexpr (requires {
+                    std::forward<A>(a).as_awaitable(
+                      static_cast<Promise &>(*this));
+                  })
+      return std::forward<A>(a).as_awaitable(static_cast<Promise &>(*this));
+    else
+      return std::forward<A>(a);
+  }
+};
+
+// The promise an awaitable is checked against when it is used as a sender in
+// environment Env. Only used unevaluated.
+template <class Env>
+struct env_promise : with_await_transform<env_promise<Env>> {
+  const Env &get_env() const noexcept;
+  std::coroutine_handle<> unhandled_stopped() noexcept;
+};
+
+template <class R> class awaitable_operation;
+// Connects an awaitable to r through a coroutine that awaits it and completes
+// r with the result. Defined with the coroutine support at the end.
+template <class A, class R> awaitable_operation<R> connect_awaitable(A a, R r);
+} // namespace detail
+
+struct connect_t {
+  template <class S, class R>
+  constexpr auto operator()(S &&s, R &&r) const
+    noexcept(noexcept(std::forward<S>(s).connect(std::forward<R>(
+      r)))) -> decltype(std::forward<S>(s).connect(std::forward<R>(r))) {
+    return std::forward<S>(s).connect(std::forward<R>(r));
+  }
+  // An awaitable without connect: the operation is a coroutine awaiting it.
+  template <class S, class R>
+    requires(!requires(S &&s, R &&r) {
+      std::forward<S>(s).connect(std::forward<R>(r));
+    }) &&
+    detail::is_awaitable<S, detail::env_promise<std::decay_t<env_of_t<R>>>>
+  auto operator()(S &&s, R &&r) const {
+    return detail::connect_awaitable(std::remove_cvref_t<S>(std::forward<S>(s)),
+      std::remove_cvref_t<R>(std::forward<R>(r)));
+  }
+};
+inline constexpr connect_t connect{};
+
 // ---- Completion signatures ----------------------------------------------
 
 // A set of Tag(Args...) signatures. Being a type_list, it works with the
@@ -464,6 +547,14 @@ template <class Tag, class... As> struct sig<Tag(As...)> {
 };
 template <class S, class Tag>
 inline constexpr bool sig_is = std::is_same_v<typename sig<S>::tag, Tag>;
+
+// set_value_t(R), or set_value_t() for void.
+template <class R> struct value_sig {
+  using type = set_value_t(R);
+};
+template <> struct value_sig<void> {
+  using type = set_value_t();
+};
 
 template <class S> struct decay_sig {
   using type = type_list<typename sig<S>::decayed>;
@@ -527,10 +618,18 @@ using variant_or_empty = typename detail::variant_or_empty_impl<Ts...>::type;
 struct get_completion_signatures_t {
   template <class S, class Env = env<>>
   constexpr auto operator()(S &&s, Env &&e = {}) const noexcept {
+    using promise = detail::env_promise<std::decay_t<Env>>;
     if constexpr (requires {
                     typename std::remove_cvref_t<S>::completion_signatures;
                   })
       return typename std::remove_cvref_t<S>::completion_signatures{};
+    else if constexpr (!requires {
+                         std::forward<S>(s).get_completion_signatures(
+                           std::forward<Env>(e));
+                       } && detail::is_awaitable<S, promise>)
+      return completion_signatures<
+        typename detail::value_sig<detail::await_result_t<S, promise>>::type,
+        set_error_t(std::exception_ptr), set_stopped_t()>{};
     else
       return std::forward<S>(s).get_completion_signatures(std::forward<Env>(e));
   }
@@ -557,10 +656,16 @@ inline constexpr bool sends_stopped =
 
 // ---- Concepts -----------------------------------------------------------
 
+namespace detail {
 template <class S>
-concept sender =
-  std::derived_from<typename std::remove_cvref_t<S>::sender_concept,
-    sender_t> &&
+concept has_sender_concept =
+  std::derived_from<typename std::remove_cvref_t<S>::sender_concept, sender_t>;
+} // namespace detail
+
+// Awaitables are senders too: connect awaits them in a coroutine.
+template <class S>
+concept sender = (detail::has_sender_concept<S> ||
+                   detail::is_awaitable<S, detail::env_promise<env<>>>) &&
   std::move_constructible<std::remove_cvref_t<S>>;
 
 template <class S, class Env = env<>>
@@ -679,22 +784,24 @@ protected:
   }
 };
 
+namespace desc {
 // The bottom layer: owns the connected receiver.
-template <class R> struct receiver_descriptor {
-  R receiver;
+template <class R> struct receiver {
+  R rcvr;
   template <class T> struct apply : sg::node::apply<T, apply<T>> {
     using base = sg::node::apply<T, apply<T>>;
-    R receiver;
+    R rcvr;
     template <class... Rest>
-    apply(receiver_descriptor d, Rest &&...rest)
+    apply(receiver d, Rest &&...rest)
         : base{sg::node{}, std::forward<Rest>(rest)...},
-          receiver(std::move(d.receiver)) {}
+          rcvr(std::move(d.rcvr)) {}
     template <class Tag, class... As> void complete(Tag, As &&...as) noexcept {
-      Tag{}(std::move(receiver), std::forward<As>(as)...);
+      Tag{}(std::move(rcvr), std::forward<As>(as)...);
     }
-    decltype(auto) get_env() const noexcept { return exec::get_env(receiver); }
+    decltype(auto) get_env() const noexcept { return exec::get_env(rcvr); }
   };
 };
+} // namespace desc
 
 // Receiver for a nested operation owned by a layer. Completions go to
 // target->complete(Tag, ...), or with a Key to target->child_complete(Key,
@@ -790,7 +897,7 @@ auto connect_descriptors(std::tuple<Ds...> &&ds, R r) {
   using bound_list = typename planned::bound_list;
   constexpr std::size_t n = sizeof...(Ds);
   return [&]<std::size_t... I>(std::index_sequence<I...>) {
-    return operation_graph{receiver_descriptor<R>{std::move(r)},
+    return operation_graph{desc::receiver<R>{std::move(r)},
       typename type_list_at<n - 1 - I, bound_list>::type(
         std::get<n - 1 - I>(std::move(ds)))...};
   }(std::index_sequence_for<Ds...>{});
@@ -856,8 +963,9 @@ template <class S> inline constexpr bool is_basic_sender = false;
 template <class... Ds>
 inline constexpr bool is_basic_sender<basic_sender<Ds...>> = true;
 
+namespace desc {
 // Connects a sender that is not a basic_sender as a nested operation.
-template <class S> struct nested_descriptor {
+template <class S> struct nested {
   S sndr;
   static constexpr bool is_source = true;
   template <class, class Env>
@@ -868,12 +976,13 @@ template <class S> struct nested_descriptor {
     using receiver_type = forward_receiver<apply, env_of_t<const T &>>;
     connect_result_t<S, receiver_type> op;
     template <class... Rest>
-    apply(nested_descriptor d, Rest &&...rest)
+    apply(nested d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...},
           op(exec::connect(std::move(d.sndr), receiver_type{this})) {}
     void start() noexcept { exec::start(op); }
   };
 };
+} // namespace desc
 
 // Appends descriptor d to sender s.
 template <class S, class D> auto append(S &&s, D d) {
@@ -883,8 +992,7 @@ template <class S, class D> auto append(S &&s, D d) {
       std::forward<S>(s).descriptors);
   else
     return basic_sender{
-      nested_descriptor<std::remove_cvref_t<S>>{std::forward<S>(s)},
-      std::move(d)};
+      desc::nested<std::remove_cvref_t<S>>{std::forward<S>(s)}, std::move(d)};
 }
 } // namespace detail
 
@@ -894,18 +1002,6 @@ namespace detail {
 template <class C>
 concept adaptor_closure = std::derived_from<std::remove_cvref_t<C>,
   sender_adaptor_closure<std::remove_cvref_t<C>>>;
-
-// Appends descriptor D to the sender it is applied to.
-template <class D> struct closure : sender_adaptor_closure<closure<D>> {
-  D descriptor;
-  explicit closure(D d) : descriptor(std::move(d)) {}
-  template <sender S> auto operator()(S &&s) && {
-    return append(std::forward<S>(s), std::move(descriptor));
-  }
-  template <sender S> auto operator()(S &&s) const & {
-    return append(std::forward<S>(s), descriptor);
-  }
-};
 
 // Calls fn(s, args...) on the sender s it is applied to.
 template <class Fn, class... As>
@@ -921,6 +1017,21 @@ struct bind_back : sender_adaptor_closure<bind_back<Fn, As...>> {
   template <sender S> auto operator()(S &&s) const & {
     return std::apply(
       [&](const As &...as) { return fn(std::forward<S>(s), as...); }, args);
+  }
+};
+
+template <class... As> inline constexpr bool leads_with_sender = false;
+template <class A, class... As>
+inline constexpr bool leads_with_sender<A, As...> = sender<A>;
+
+// Base of a pipeable adaptor object. Self takes the sender first; called
+// without one, the object returns a closure that applies Self to the sender
+// it is given later.
+template <class Self> struct adaptor {
+  template <class... As>
+    requires(!leads_with_sender<As...>)
+  auto operator()(As &&...as) const {
+    return bind_back{Self{}, std::decay_t<As>(std::forward<As>(as))...};
   }
 };
 
@@ -949,7 +1060,8 @@ auto operator|(A &&a, B &&b) {
 // ---- Sources: just, just_error, just_stopped, read_env -------------------
 
 namespace detail {
-template <class Tag, class... Vs> struct just_descriptor {
+namespace desc {
+template <class Tag, class... Vs> struct just {
   std::tuple<Vs...> values;
   static constexpr bool is_source = true;
   template <class, class> using completions = completion_signatures<Tag(Vs...)>;
@@ -957,7 +1069,7 @@ template <class Tag, class... Vs> struct just_descriptor {
     using base = layer<T, apply<T, In>>;
     std::tuple<Vs...> values;
     template <class... Rest>
-    apply(just_descriptor d, Rest &&...rest)
+    apply(just d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, values(std::move(d.values)) {}
     void start() noexcept {
       std::apply(
@@ -967,7 +1079,7 @@ template <class Tag, class... Vs> struct just_descriptor {
   };
 };
 
-template <class Q> struct read_env_descriptor {
+template <class Q> struct read_env {
   [[no_unique_address]] Q query;
   static constexpr bool is_source = true;
   template <class, class Env>
@@ -977,7 +1089,7 @@ template <class Q> struct read_env_descriptor {
     using base = layer<T, apply<T, In>>;
     [[no_unique_address]] Q query;
     template <class... Rest>
-    apply(read_env_descriptor d, Rest &&...rest)
+    apply(read_env d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, query(d.query) {}
     void start() noexcept {
       using value = std::decay_t<
@@ -986,34 +1098,39 @@ template <class Q> struct read_env_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
-template <class... Vs> auto just(Vs &&...vs) {
-  return basic_sender{detail::just_descriptor<set_value_t, std::decay_t<Vs>...>{
-    {std::forward<Vs>(vs)...}}};
-}
-template <class E> auto just_error(E &&e) {
-  return basic_sender{detail::just_descriptor<set_error_t, std::decay_t<E>>{
-    {std::forward<E>(e)}}};
-}
-inline auto just_stopped() {
-  return basic_sender{detail::just_descriptor<set_stopped_t>{{}}};
-}
-template <class Q> auto read_env(Q q) {
-  return basic_sender{detail::read_env_descriptor<Q>{q}};
-}
+struct just_t {
+  template <class... Vs> auto operator()(Vs &&...vs) const {
+    return basic_sender{detail::desc::just<set_value_t, std::decay_t<Vs>...>{
+      {std::forward<Vs>(vs)...}}};
+  }
+};
+struct just_error_t {
+  template <class E> auto operator()(E &&e) const {
+    return basic_sender{
+      detail::desc::just<set_error_t, std::decay_t<E>>{{std::forward<E>(e)}}};
+  }
+};
+struct just_stopped_t {
+  auto operator()() const {
+    return basic_sender{detail::desc::just<set_stopped_t>{{}}};
+  }
+};
+struct read_env_t {
+  template <class Q> auto operator()(Q q) const {
+    return basic_sender{detail::desc::read_env<Q>{q}};
+  }
+};
+inline constexpr just_t just{};
+inline constexpr just_error_t just_error{};
+inline constexpr just_stopped_t just_stopped{};
+inline constexpr read_env_t read_env{};
 
 // ---- then, upon_error, upon_stopped -------------------------------------
 
 namespace detail {
-// set_value_t(R), or set_value_t() for void.
-template <class R> struct value_sig {
-  using type = set_value_t(R);
-};
-template <> struct value_sig<void> {
-  using type = set_value_t();
-};
-
 template <class Sig, class Tag, class F> struct then_sig {
   using type = completion_signatures<Sig>;
 };
@@ -1024,7 +1141,8 @@ template <class Tag, class F, class... As> struct then_sig<Tag(As...), Tag, F> {
       exception_sigs<std::is_nothrow_invocable_v<F &, As...>>>;
 };
 
-template <class Tag, class F> struct then_descriptor {
+namespace desc {
+template <class Tag, class F> struct then {
   F function;
   static constexpr bool is_source = false;
   template <class In, class>
@@ -1034,7 +1152,7 @@ template <class Tag, class F> struct then_descriptor {
     using base = layer<T, apply<T, In>>;
     F function;
     template <class... Rest>
-    apply(then_descriptor d, Rest &&...rest)
+    apply(then d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, function(std::move(d.function)) {}
     template <class C, class... As> void complete(C, As &&...as) noexcept {
       if constexpr (!std::is_same_v<C, Tag>) {
@@ -1053,6 +1171,7 @@ template <class Tag, class F> struct then_descriptor {
     }
   };
 };
+} // namespace desc
 
 // ---- let_value, let_error, let_stopped ----------------------------------
 
@@ -1077,7 +1196,8 @@ struct let_sig<Tag(As...), Tag, F, Env> {
     exception_sigs<false>>;
 };
 
-template <class Tag, class F> struct let_descriptor {
+namespace desc {
+template <class Tag, class F> struct let {
   F function;
   static constexpr bool is_source = false;
   template <class In, class Env>
@@ -1094,7 +1214,7 @@ template <class Tag, class F> struct let_descriptor {
     gather_signatures_t<Tag, In, state, monostate_variant> ops;
 
     template <class... Rest>
-    apply(let_descriptor d, Rest &&...rest)
+    apply(let d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, function(std::move(d.function)) {}
 
     template <class C, class... As> void complete(C, As &&...as) noexcept {
@@ -1111,30 +1231,43 @@ template <class Tag, class F> struct let_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
-#define SG_EXEC_ADAPTOR(name, kind, tag)                                       \
-  template <class F> auto name(F f) {                                          \
-    return detail::closure{detail::kind##_descriptor<tag, F>{std::move(f)}};   \
-  }                                                                            \
-  template <sender S, class F> auto name(S &&s, F f) {                         \
-    return name(std::move(f))(std::forward<S>(s));                             \
+namespace detail {
+// then, upon_*, let_*: appends D<Tag, F> to the sender.
+template <template <class, class> class D, class Tag>
+struct function_adaptor : adaptor<function_adaptor<D, Tag>> {
+  using adaptor<function_adaptor>::operator();
+  template <sender S, class F> auto operator()(S &&s, F f) const {
+    return append(std::forward<S>(s), D<Tag, F>{std::move(f)});
   }
-SG_EXEC_ADAPTOR(then, then, set_value_t)
-SG_EXEC_ADAPTOR(upon_error, then, set_error_t)
-SG_EXEC_ADAPTOR(upon_stopped, then, set_stopped_t)
-SG_EXEC_ADAPTOR(let_value, let, set_value_t)
-SG_EXEC_ADAPTOR(let_error, let, set_error_t)
-SG_EXEC_ADAPTOR(let_stopped, let, set_stopped_t)
-#undef SG_EXEC_ADAPTOR
+};
+} // namespace detail
+
+using then_t = detail::function_adaptor<detail::desc::then, set_value_t>;
+using upon_error_t = detail::function_adaptor<detail::desc::then, set_error_t>;
+using upon_stopped_t =
+  detail::function_adaptor<detail::desc::then, set_stopped_t>;
+using let_value_t = detail::function_adaptor<detail::desc::let, set_value_t>;
+using let_error_t = detail::function_adaptor<detail::desc::let, set_error_t>;
+using let_stopped_t =
+  detail::function_adaptor<detail::desc::let, set_stopped_t>;
+inline constexpr then_t then{};
+inline constexpr upon_error_t upon_error{};
+inline constexpr upon_stopped_t upon_stopped{};
+inline constexpr let_value_t let_value{};
+inline constexpr let_error_t let_error{};
+inline constexpr let_stopped_t let_stopped{};
 
 // ---- write_env ----------------------------------------------------------
 
 namespace detail {
+namespace desc {
 // A graph state, not a step: it holds E, and the layers before it see E in
 // front of the environment below. Completions pass through it by
 // inheritance.
-template <class E> struct env_descriptor {
+template <class E> struct write_env {
   E environment;
   static constexpr bool is_source = false;
   template <class In, class> using completions = In;
@@ -1145,7 +1278,7 @@ template <class E> struct env_descriptor {
     using outer_env = std::decay_t<env_of_t<const T &>>;
     E environment;
     template <class... Rest>
-    apply(env_descriptor d, Rest &&...rest)
+    apply(write_env d, Rest &&...rest)
         : base{sg::state{}, std::forward<Rest>(rest)...},
           environment(std::move(d.environment)) {}
     env<E, outer_env> get_env() const noexcept {
@@ -1153,15 +1286,17 @@ template <class E> struct env_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
-template <sender S, class E> auto write_env(S &&s, E e) {
-  return detail::append(
-    std::forward<S>(s), detail::env_descriptor<E>{std::move(e)});
-}
-template <class E> auto write_env(E e) {
-  return detail::closure{detail::env_descriptor<E>{std::move(e)}};
-}
+struct write_env_t : detail::adaptor<write_env_t> {
+  using adaptor::operator();
+  template <sender S, class E> auto operator()(S &&s, E e) const {
+    return detail::append(
+      std::forward<S>(s), detail::desc::write_env<E>{std::move(e)});
+  }
+};
+inline constexpr write_env_t write_env{};
 
 // ---- into_variant, stopped_as_optional, stopped_as_error -----------------
 
@@ -1170,7 +1305,8 @@ template <class In>
 using into_variant_type =
   gather_signatures_t<set_value_t, In, decayed_tuple, variant_or_empty>;
 
-struct into_variant_descriptor {
+namespace desc {
+struct into_variant {
   static constexpr bool is_source = false;
   template <class In, class>
   using completions = concat_sigs_t<
@@ -1181,8 +1317,7 @@ struct into_variant_descriptor {
   template <class T, class In> struct apply : layer<T, apply<T, In>> {
     using base = layer<T, apply<T, In>>;
     template <class... Rest>
-    apply(into_variant_descriptor, Rest &&...rest)
-        : base{std::forward<Rest>(rest)...} {}
+    apply(into_variant, Rest &&...rest) : base{std::forward<Rest>(rest)...} {}
     template <class C, class... As> void complete(C, As &&...as) noexcept {
       if constexpr (!std::is_same_v<C, set_value_t>) {
         this->pass(C{}, std::forward<As>(as)...);
@@ -1196,6 +1331,7 @@ struct into_variant_descriptor {
     }
   };
 };
+} // namespace desc
 
 template <class Sig> struct as_optional_sig {
   using type = completion_signatures<Sig>;
@@ -1209,7 +1345,8 @@ template <> struct as_optional_sig<set_stopped_t()> {
   using type = completion_signatures<>;
 };
 
-struct stopped_as_optional_descriptor {
+namespace desc {
+struct stopped_as_optional {
   static constexpr bool is_source = false;
   template <class In, class> using completions = sig_map_t<In, as_optional_sig>;
   template <class T, class In> struct apply : layer<T, apply<T, In>> {
@@ -1221,7 +1358,7 @@ struct stopped_as_optional_descriptor {
       "stopped_as_optional requires exactly one value completion of one value");
     using optional_type = std::optional<typename type_list_at<0, values>::type>;
     template <class... Rest>
-    apply(stopped_as_optional_descriptor, Rest &&...rest)
+    apply(stopped_as_optional, Rest &&...rest)
         : base{std::forward<Rest>(rest)...} {}
     template <class C, class... As> void complete(C, As &&...as) noexcept {
       if constexpr (std::is_same_v<C, set_value_t>) {
@@ -1238,33 +1375,39 @@ struct stopped_as_optional_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
-inline auto into_variant() {
-  return detail::closure{detail::into_variant_descriptor{}};
-}
-template <sender S> auto into_variant(S &&s) {
-  return into_variant()(std::forward<S>(s));
-}
-inline auto stopped_as_optional() {
-  return detail::closure{detail::stopped_as_optional_descriptor{}};
-}
-template <sender S> auto stopped_as_optional(S &&s) {
-  return stopped_as_optional()(std::forward<S>(s));
-}
-template <class E> auto stopped_as_error(E e) {
-  return let_stopped(
-    [e = std::move(e)]() mutable { return just_error(std::move(e)); });
-}
-template <sender S, class E> auto stopped_as_error(S &&s, E e) {
-  return stopped_as_error(std::move(e))(std::forward<S>(s));
-}
+struct into_variant_t : detail::adaptor<into_variant_t> {
+  using adaptor::operator();
+  template <sender S> auto operator()(S &&s) const {
+    return detail::append(std::forward<S>(s), detail::desc::into_variant{});
+  }
+};
+struct stopped_as_optional_t : detail::adaptor<stopped_as_optional_t> {
+  using adaptor::operator();
+  template <sender S> auto operator()(S &&s) const {
+    return detail::append(
+      std::forward<S>(s), detail::desc::stopped_as_optional{});
+  }
+};
+struct stopped_as_error_t : detail::adaptor<stopped_as_error_t> {
+  using adaptor::operator();
+  template <sender S, class E> auto operator()(S &&s, E e) const {
+    return let_stopped(std::forward<S>(s),
+      [e = std::move(e)]() mutable { return just_error(std::move(e)); });
+  }
+};
+inline constexpr into_variant_t into_variant{};
+inline constexpr stopped_as_optional_t stopped_as_optional{};
+inline constexpr stopped_as_error_t stopped_as_error{};
 
 // ---- schedule_from, continues_on, starts_on, on --------------------------
 
 namespace detail {
+namespace desc {
 // Stores the decayed completion, then completes it again from the scheduler.
-template <class Sch> struct schedule_from_descriptor {
+template <class Sch> struct schedule_from {
   Sch sch;
   static constexpr bool is_source = false;
   sched_attrs<Sch> attrs() const noexcept { return {sch}; }
@@ -1288,7 +1431,7 @@ template <class Sch> struct schedule_from_descriptor {
     connect_result_t<schedule_result_t<Sch &>, receiver_type> op;
 
     template <class... Rest>
-    apply(schedule_from_descriptor d, Rest &&...rest)
+    apply(schedule_from d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, sch(std::move(d.sch)),
           op(exec::connect(exec::schedule(sch), receiver_type{this})) {}
 
@@ -1319,53 +1462,64 @@ template <class Sch> struct schedule_from_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
-template <scheduler Sch, sender S> auto schedule_from(Sch sch, S &&s) {
-  return detail::append(
-    std::forward<S>(s), detail::schedule_from_descriptor<Sch>{std::move(sch)});
-}
-template <scheduler Sch> auto continues_on(Sch sch) {
-  return detail::closure{detail::schedule_from_descriptor<Sch>{std::move(sch)}};
-}
-template <sender S, scheduler Sch> auto continues_on(S &&s, Sch sch) {
-  return schedule_from(std::move(sch), std::forward<S>(s));
-}
+struct schedule_from_t {
+  template <scheduler Sch, sender S> auto operator()(Sch sch, S &&s) const {
+    return detail::append(
+      std::forward<S>(s), detail::desc::schedule_from<Sch>{std::move(sch)});
+  }
+};
+inline constexpr schedule_from_t schedule_from{};
 
-template <scheduler Sch, sender S> auto starts_on(Sch sch, S &&s) {
-  return let_value(schedule(sch),
-    [sch, s = std::remove_cvref_t<S>(std::forward<S>(s))]() mutable {
-      return write_env(std::move(s), prop{get_scheduler, sch});
-    });
-}
+struct continues_on_t : detail::adaptor<continues_on_t> {
+  using adaptor::operator();
+  template <sender S, scheduler Sch> auto operator()(S &&s, Sch sch) const {
+    return schedule_from(std::move(sch), std::forward<S>(s));
+  }
+};
+inline constexpr continues_on_t continues_on{};
 
-// Runs s on sch, then returns to the scheduler of the receiver's environment.
-template <scheduler Sch, sender S> auto on(Sch sch, S &&s) {
-  return let_value(read_env(get_scheduler),
-    [sch, s = std::remove_cvref_t<S>(std::forward<S>(s))](auto orig) mutable {
-      return continues_on(starts_on(sch, std::move(s)), orig);
-    });
-}
-// Completes s, runs closure c on sch, then returns to the original scheduler.
-template <sender S, scheduler Sch, detail::adaptor_closure C>
-auto on(S &&s, Sch sch, C &&c) {
-  return let_value(read_env(get_scheduler),
-    [sch, s = std::remove_cvref_t<S>(std::forward<S>(s)),
-      c = std::remove_cvref_t<C>(std::forward<C>(c))](auto orig) mutable {
-      return continues_on(
-        write_env(std::move(c)(continues_on(std::move(s), sch)),
-          prop{get_scheduler, sch}),
-        orig);
-    });
-}
-template <scheduler Sch, detail::adaptor_closure C> auto on(Sch sch, C &&c) {
-  using closure = std::remove_cvref_t<C>;
-  return detail::bind_back{
-    []<class S>(S &&s, Sch sch, closure c) {
-      return on(std::forward<S>(s), std::move(sch), std::move(c));
-    },
-    std::move(sch), closure(std::forward<C>(c))};
-}
+struct starts_on_t {
+  template <scheduler Sch, sender S> auto operator()(Sch sch, S &&s) const {
+    return let_value(schedule(sch),
+      [sch, s = std::remove_cvref_t<S>(std::forward<S>(s))]() mutable {
+        return write_env(std::move(s), prop{get_scheduler, sch});
+      });
+  }
+};
+inline constexpr starts_on_t starts_on{};
+
+struct on_t {
+  // Runs s on sch, then returns to the scheduler of the receiver's
+  // environment.
+  template <scheduler Sch, sender S> auto operator()(Sch sch, S &&s) const {
+    return let_value(read_env(get_scheduler),
+      [sch, s = std::remove_cvref_t<S>(std::forward<S>(s))](auto orig) mutable {
+        return continues_on(starts_on(sch, std::move(s)), orig);
+      });
+  }
+  // Completes s, runs closure c on sch, then returns to the original
+  // scheduler.
+  template <sender S, scheduler Sch, detail::adaptor_closure C>
+  auto operator()(S &&s, Sch sch, C &&c) const {
+    return let_value(read_env(get_scheduler),
+      [sch, s = std::remove_cvref_t<S>(std::forward<S>(s)),
+        c = std::remove_cvref_t<C>(std::forward<C>(c))](auto orig) mutable {
+        return continues_on(
+          write_env(std::move(c)(continues_on(std::move(s), sch)),
+            prop{get_scheduler, sch}),
+          orig);
+      });
+  }
+  template <scheduler Sch, detail::adaptor_closure C>
+  auto operator()(Sch sch, C &&c) const {
+    return detail::bind_back{
+      on_t{}, std::move(sch), std::remove_cvref_t<C>(std::forward<C>(c))};
+  }
+};
+inline constexpr on_t on{};
 
 // ---- when_all -----------------------------------------------------------
 
@@ -1399,10 +1553,11 @@ template <class Env, class... Ss> struct when_all_traits {
     completion_signatures<set_stopped_t()>>;
 };
 
+namespace desc {
 // Waits for every child. The first error, or else a stop, wins and requests
 // stop on the remaining children. A stop request from the receiver's
 // environment is forwarded to the children.
-template <class... Ss> struct when_all_descriptor {
+template <class... Ss> struct when_all {
   std::tuple<Ss...> senders;
   static constexpr bool is_source = true;
   template <class, class Env>
@@ -1445,7 +1600,7 @@ template <class... Ss> struct when_all_descriptor {
     children<std::index_sequence_for<Ss...>> ops;
 
     template <class... Rest>
-    apply(when_all_descriptor d, Rest &&...rest)
+    apply(when_all d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, ops(this, std::move(d.senders)) {}
 
     // What the children see; this layer itself uses downstream_env().
@@ -1536,40 +1691,49 @@ template <class... Ss> struct when_all_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
-template <sender... Ss> auto when_all(Ss &&...ss) {
-  return basic_sender{detail::when_all_descriptor<std::remove_cvref_t<Ss>...>{
-    {std::forward<Ss>(ss)...}}};
-}
-template <sender... Ss> auto when_all_with_variant(Ss &&...ss) {
-  return when_all(into_variant(std::forward<Ss>(ss))...);
-}
+struct when_all_t {
+  template <sender... Ss> auto operator()(Ss &&...ss) const {
+    return basic_sender{detail::desc::when_all<std::remove_cvref_t<Ss>...>{
+      {std::forward<Ss>(ss)...}}};
+  }
+};
+inline constexpr when_all_t when_all{};
+struct when_all_with_variant_t {
+  template <sender... Ss> auto operator()(Ss &&...ss) const {
+    return when_all(into_variant(std::forward<Ss>(ss))...);
+  }
+};
+inline constexpr when_all_with_variant_t when_all_with_variant{};
 
 // ---- Execution resources ------------------------------------------------
 
+namespace detail::desc {
+// Completes inline, on the thread that starts it. Sch is inline_scheduler,
+// which is still incomplete here.
+template <class Sch> struct inline_schedule {
+  static constexpr bool is_source = true;
+  template <class, class>
+  using completions = completion_signatures<set_value_t()>;
+  sched_attrs<Sch> attrs() const noexcept { return {Sch{}}; }
+  template <class T, class In> struct apply : layer<T, apply<T, In>> {
+    using base = layer<T, apply<T, In>>;
+    template <class... Rest>
+    apply(inline_schedule, Rest &&...rest)
+        : base{std::forward<Rest>(rest)...} {}
+    void start() noexcept { this->pass(set_value_t{}); }
+  };
+};
+} // namespace detail::desc
+
 // Completes schedule() inline, on the thread that starts it.
 class inline_scheduler {
-  struct schedule_descriptor {
-    static constexpr bool is_source = true;
-    template <class, class>
-    using completions = completion_signatures<set_value_t()>;
-    auto attrs() const noexcept {
-      return detail::sched_attrs<inline_scheduler>{inline_scheduler{}};
-    }
-    template <class T, class In> struct apply : detail::layer<T, apply<T, In>> {
-      using base = detail::layer<T, apply<T, In>>;
-      template <class... Rest>
-      apply(schedule_descriptor, Rest &&...rest)
-          : base{std::forward<Rest>(rest)...} {}
-      void start() noexcept { this->pass(set_value_t{}); }
-    };
-  };
-
 public:
   using scheduler_concept = scheduler_t;
   auto schedule() const noexcept {
-    return basic_sender<schedule_descriptor>{schedule_descriptor{}};
+    return basic_sender{detail::desc::inline_schedule<inline_scheduler>{}};
   }
   friend bool operator==(inline_scheduler, inline_scheduler) noexcept = default;
 };
@@ -1669,7 +1833,9 @@ inline std::exception_ptr closed_error() noexcept {
   }
 }
 
-template <class Owner> struct queue_schedule_descriptor;
+namespace desc {
+template <class Owner> struct queue_schedule;
+}
 
 // The scheduler of an execution resource that runs a task_queue. Owner only
 // makes the type distinct.
@@ -1679,8 +1845,8 @@ template <class Owner> class queue_scheduler {
 public:
   using scheduler_concept = scheduler_t;
   explicit queue_scheduler(task_queue *queue) noexcept : queue_(queue) {}
-  basic_sender<queue_schedule_descriptor<Owner>> schedule() const noexcept {
-    return basic_sender{queue_schedule_descriptor<Owner>{queue_}};
+  basic_sender<desc::queue_schedule<Owner>> schedule() const noexcept {
+    return basic_sender{desc::queue_schedule<Owner>{queue_}};
   }
   constexpr forward_progress_guarantee query(
     get_forward_progress_guarantee_t) const noexcept {
@@ -1695,9 +1861,10 @@ public:
     const queue_scheduler &, const queue_scheduler &) noexcept = default;
 };
 
+namespace desc {
 // Queues a task; when it runs, completes with set_stopped if stop was
 // requested, else set_value. Fails if the queue is finishing.
-template <class Owner> struct queue_schedule_descriptor {
+template <class Owner> struct queue_schedule {
   task_queue *queue;
   static constexpr bool is_source = true;
   template <class, class>
@@ -1710,7 +1877,7 @@ template <class Owner> struct queue_schedule_descriptor {
     using base = layer<T, apply<T, In>>;
     task_queue *queue;
     template <class... Rest>
-    apply(queue_schedule_descriptor d, Rest &&...rest)
+    apply(queue_schedule d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, queue(d.queue) {}
     void start() noexcept {
       execute = [](task *t) noexcept {
@@ -1725,6 +1892,7 @@ template <class Owner> struct queue_schedule_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
 // A FIFO execution resource drained by run(). After finish(), queued work
@@ -1844,12 +2012,12 @@ template <class Env> struct bulk_schedule_sigs<no_scheduler, Env> {
   using type = type_list<>;
 };
 
+namespace desc {
 // Runs the function over [0, shape) on each value completion, then passes
 // the values on. With a scheduler (Sch is not no_scheduler) the values are
 // stored, the range is split into chunks that run on it, and the last chunk
 // to finish completes. Otherwise the range runs inline.
-template <bulk_kind Kind, class Shape, class F, class Sch>
-struct bulk_descriptor {
+template <bulk_kind Kind, class Shape, class F, class Sch> struct bulk {
   using fn = bulk_function<Kind, Shape, F>;
   static constexpr bool parallel = !std::is_same_v<Sch, no_scheduler>;
   template <class A>
@@ -1878,7 +2046,7 @@ struct bulk_descriptor {
     Shape shape;
     fn function;
     template <class... Rest>
-    inline_layer(bulk_descriptor d, Rest &&...rest)
+    inline_layer(bulk d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, shape(d.shape),
           function(std::move(d.function)) {}
     template <class C, class... As> void complete(C, As &&...as) noexcept {
@@ -1938,7 +2106,7 @@ struct bulk_descriptor {
     chunks_type tasks;
 
     template <class... Rest>
-    parallel_layer(bulk_descriptor d, Rest &&...rest)
+    parallel_layer(bulk d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, sch(std::move(d.sch)),
           shape(d.shape), function(std::move(d.function)) {
       if constexpr (runs_bulk<Sch>) {
@@ -2080,6 +2248,7 @@ struct bulk_descriptor {
   using apply =
     std::conditional_t<parallel, parallel_layer<T, In>, inline_layer<T, In>>;
 };
+} // namespace desc
 
 // The scheduler a parallel bulk runs on: where s completes, if that resource
 // is parallel and P is a parallel policy.
@@ -2096,35 +2265,24 @@ template <class P, class S> auto bulk_scheduler_of(const S &s) noexcept {
   }
 }
 
-template <bulk_kind Kind, class P, class S, class Shape, class F>
-auto make_bulk(S &&s, Shape shape, F f) {
-  auto sch = bulk_scheduler_of<P>(s);
-  return append(std::forward<S>(s),
-    bulk_descriptor<Kind, Shape, F, decltype(sch)>{
-      shape, {std::move(f)}, std::move(sch)});
-}
+template <bulk_kind Kind> struct bulk_adaptor : adaptor<bulk_adaptor<Kind>> {
+  using adaptor<bulk_adaptor>::operator();
+  template <sender S, execution_policy P, std::integral Shape, class F>
+  auto operator()(S &&s, P &&, Shape shape, F f) const {
+    auto sch = bulk_scheduler_of<P>(s);
+    return append(std::forward<S>(s),
+      desc::bulk<Kind, Shape, F, decltype(sch)>{
+        shape, {std::move(f)}, std::move(sch)});
+  }
+};
 } // namespace detail
 
-#define SG_EXEC_BULK(name, kind)                                               \
-  template <sender S, detail::execution_policy P, std::integral Shape,         \
-    class F>                                                                   \
-  auto name(S &&s, P &&, Shape shape, F f) {                                   \
-    return detail::make_bulk<detail::bulk_kind::kind, P>(                      \
-      std::forward<S>(s), shape, std::move(f));                                \
-  }                                                                            \
-  template <detail::execution_policy P, std::integral Shape, class F>          \
-  auto name(P &&, Shape shape, F f) {                                          \
-    return detail::bind_back{                                                  \
-      []<class S>(S &&s, Shape shape, F f) {                                   \
-        return detail::make_bulk<detail::bulk_kind::kind, P>(                  \
-          std::forward<S>(s), shape, std::move(f));                            \
-      },                                                                       \
-      shape, std::move(f)};                                                    \
-  }
-SG_EXEC_BULK(bulk, each)
-SG_EXEC_BULK(bulk_chunked, chunked)
-SG_EXEC_BULK(bulk_unchunked, unchunked)
-#undef SG_EXEC_BULK
+using bulk_t = detail::bulk_adaptor<detail::bulk_kind::each>;
+using bulk_chunked_t = detail::bulk_adaptor<detail::bulk_kind::chunked>;
+using bulk_unchunked_t = detail::bulk_adaptor<detail::bulk_kind::unchunked>;
+inline constexpr bulk_t bulk{};
+inline constexpr bulk_chunked_t bulk_chunked{};
+inline constexpr bulk_unchunked_t bulk_unchunked{};
 
 // ---- Async scopes -------------------------------------------------------
 
@@ -2136,10 +2294,11 @@ concept scope_token = std::copyable<T> && requires(const T &t) {
 };
 
 namespace detail {
+namespace desc {
 // The steps before it see a stop token that fires when either token or the
 // stop token below requests stop. Callbacks are registered at connect, as
 // the layers before it have no start of their own, and removed on completion.
-struct stop_when_descriptor {
+struct stop_when {
   inplace_stop_token token;
   static constexpr bool is_source = false;
   template <class In, class> using completions = In;
@@ -2162,7 +2321,7 @@ struct stop_when_descriptor {
     std::conditional_t<merge, merged, unmerged> stop;
 
     template <class... Rest>
-    apply(stop_when_descriptor d, Rest &&...rest)
+    apply(stop_when d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, token(d.token) {
       if constexpr (merge) {
         stop.on_outer.emplace(
@@ -2190,7 +2349,7 @@ struct stop_when_descriptor {
 
 // Holds sndr and, if the scope of token accepted it, an association; a copy
 // tries to make its own. Started without one, it completes with set_stopped.
-template <class Token, class S> struct associate_descriptor {
+template <class Token, class S> struct associate {
   Token token;
   S sndr;
   bool associated;
@@ -2199,18 +2358,17 @@ template <class Token, class S> struct associate_descriptor {
   using completions = concat_sigs_t<completion_signatures_of_t<S, Env>,
     completion_signatures<set_stopped_t()>>;
 
-  associate_descriptor(Token t, S s)
+  associate(Token t, S s)
       : token(std::move(t)), sndr(std::move(s)),
         associated(token.try_associate()) {}
-  associate_descriptor(const associate_descriptor &other)
+  associate(const associate &other)
       : token(other.token), sndr(other.sndr),
         associated(other.associated && token.try_associate()) {}
-  associate_descriptor(associate_descriptor &&other) noexcept(
-    std::is_nothrow_move_constructible_v<S>)
+  associate(associate &&other) noexcept(std::is_nothrow_move_constructible_v<S>)
       : token(other.token), sndr(std::move(other.sndr)),
         associated(std::exchange(other.associated, false)) {}
-  associate_descriptor &operator=(const associate_descriptor &) = delete;
-  ~associate_descriptor() {
+  associate &operator=(const associate &) = delete;
+  ~associate() {
     if (associated)
       token.disassociate();
   }
@@ -2228,7 +2386,7 @@ template <class Token, class S> struct associate_descriptor {
     std::optional<child> c;
 
     template <class... Rest>
-    apply(associate_descriptor d, Rest &&...rest)
+    apply(associate d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, token(d.token) {
       if (d.associated) {
         c.emplace(std::move(d.sndr), receiver_type{this});
@@ -2255,6 +2413,7 @@ template <class Token, class S> struct associate_descriptor {
     }
   };
 };
+} // namespace desc
 
 template <class Token, class S>
 using wrapped_t =
@@ -2365,18 +2524,19 @@ template <class Token, class S, class Env> struct future_state {
   }
 };
 
+namespace desc {
 // The future sender: owns the state, which is null if spawning was refused.
-template <class State> struct future_descriptor {
+template <class State> struct future {
   State *state;
   static constexpr bool is_source = true;
   template <class, class>
   using completions = concat_sigs_t<typename State::stored_sigs,
     completion_signatures<set_stopped_t()>>;
 
-  explicit future_descriptor(State *s) noexcept : state(s) {}
-  future_descriptor(future_descriptor &&other) noexcept
+  explicit future(State *s) noexcept : state(s) {}
+  future(future &&other) noexcept
       : state(std::exchange(other.state, nullptr)) {}
-  ~future_descriptor() {
+  ~future() {
     if (state)
       state->abandon();
   }
@@ -2390,7 +2550,7 @@ template <class State> struct future_descriptor {
       on_stop;
 
     template <class... Rest>
-    apply(future_descriptor d, Rest &&...rest)
+    apply(future d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...},
           state(std::exchange(d.state, nullptr)) {}
     ~apply() {
@@ -2431,6 +2591,7 @@ template <class State> struct future_descriptor {
     }
   };
 };
+} // namespace desc
 
 struct join_waiter {
   join_waiter *next = nullptr;
@@ -2514,9 +2675,10 @@ public:
   }
 };
 
+namespace desc {
 // Completes with set_value once the scope's count reaches zero, on the thread
 // that ends the last association (or inline).
-struct join_descriptor {
+struct join {
   scope_count *scope;
   static constexpr bool is_source = true;
   template <class, class>
@@ -2526,7 +2688,7 @@ struct join_descriptor {
     using base = layer<T, apply<T, In>>;
     scope_count *scope;
     template <class... Rest>
-    apply(join_descriptor d, Rest &&...rest)
+    apply(join d, Rest &&...rest)
         : base{std::forward<Rest>(rest)...}, scope(d.scope) {}
     void start() noexcept {
       resume = [](join_waiter *w) noexcept {
@@ -2537,67 +2699,73 @@ struct join_descriptor {
     }
   };
 };
+} // namespace desc
 } // namespace detail
 
 // Runs s inside the scope of token, or completes with set_stopped if the
 // scope refuses new work.
-template <sender S, scope_token Token> auto associate(S &&s, Token token) {
-  using wrapped = detail::wrapped_t<Token, S>;
-  return basic_sender{detail::associate_descriptor<Token, wrapped>{
-    token, token.wrap(std::forward<S>(s))}};
-}
-template <scope_token Token> auto associate(Token token) {
-  return detail::bind_back{[]<class S>(S &&s, Token token) {
-                             return associate(std::forward<S>(s), token);
-                           },
-    std::move(token)};
-}
+struct associate_t : detail::adaptor<associate_t> {
+  using adaptor::operator();
+  template <sender S, scope_token Token>
+  auto operator()(S &&s, Token token) const {
+    using wrapped = detail::wrapped_t<Token, S>;
+    return basic_sender{detail::desc::associate<Token, wrapped>{
+      token, token.wrap(std::forward<S>(s))}};
+  }
+};
+inline constexpr associate_t associate{};
 
 // Starts s inside the scope of token and forgets it; s must complete with
 // set_value() or set_stopped(). Does nothing if the scope refuses new work.
-template <sender S, scope_token Token, class Env = env<>>
-void spawn(S &&s, Token token, Env e = {}) {
-  using wrapped = detail::wrapped_t<Token, S>;
-  using allowed = completion_signatures<set_value_t(), set_stopped_t()>;
-  static_assert(
-    std::is_same_v<
-      detail::concat_sigs_t<allowed, completion_signatures_of_t<wrapped, Env>>,
-      allowed>,
-    "spawn requires a sender that completes with set_value() or set_stopped()");
-  wrapped w = token.wrap(std::forward<S>(s));
-  if (!token.try_associate())
-    return;
-  detail::spawn_state<Token, wrapped, Env> *state;
-  try {
-    state = new detail::spawn_state<Token, wrapped, Env>(
-      token, std::move(w), std::move(e));
-  } catch (...) {
-    token.disassociate();
-    throw;
-  }
-  exec::start(state->op);
-}
-
-// Starts s inside the scope of token now and returns a sender of its result.
-// Dropping the sender unstarted requests stop on s. If the scope refuses new
-// work, the sender completes with set_stopped.
-template <sender S, scope_token Token, class Env = env<>>
-auto spawn_future(S &&s, Token token, Env e = {}) {
-  using wrapped = detail::wrapped_t<Token, S>;
-  using state_type = detail::future_state<Token, wrapped, Env>;
-  wrapped w = token.wrap(std::forward<S>(s));
-  state_type *state = nullptr;
-  if (token.try_associate()) {
+struct spawn_t {
+  template <sender S, scope_token Token, class Env = env<>>
+  void operator()(S &&s, Token token, Env e = {}) const {
+    using wrapped = detail::wrapped_t<Token, S>;
+    using allowed = completion_signatures<set_value_t(), set_stopped_t()>;
+    static_assert(std::is_same_v<detail::concat_sigs_t<allowed,
+                                   completion_signatures_of_t<wrapped, Env>>,
+                    allowed>,
+      "spawn requires a sender that completes with set_value() or "
+      "set_stopped()");
+    wrapped w = token.wrap(std::forward<S>(s));
+    if (!token.try_associate())
+      return;
+    detail::spawn_state<Token, wrapped, Env> *state;
     try {
-      state = new state_type(token, std::move(w), std::move(e));
+      state = new detail::spawn_state<Token, wrapped, Env>(
+        token, std::move(w), std::move(e));
     } catch (...) {
       token.disassociate();
       throw;
     }
     exec::start(state->op);
   }
-  return basic_sender{detail::future_descriptor<state_type>{state}};
-}
+};
+inline constexpr spawn_t spawn{};
+
+// Starts s inside the scope of token now and returns a sender of its result.
+// Dropping the sender unstarted requests stop on s. If the scope refuses new
+// work, the sender completes with set_stopped.
+struct spawn_future_t {
+  template <sender S, scope_token Token, class Env = env<>>
+  auto operator()(S &&s, Token token, Env e = {}) const {
+    using wrapped = detail::wrapped_t<Token, S>;
+    using state_type = detail::future_state<Token, wrapped, Env>;
+    wrapped w = token.wrap(std::forward<S>(s));
+    state_type *state = nullptr;
+    if (token.try_associate()) {
+      try {
+        state = new state_type(token, std::move(w), std::move(e));
+      } catch (...) {
+        token.disassociate();
+        throw;
+      }
+      exec::start(state->op);
+    }
+    return basic_sender{detail::desc::future<state_type>{state}};
+  }
+};
+inline constexpr spawn_future_t spawn_future{};
 
 // Counts the work associated with it. close() refuses new work; join() is a
 // sender that completes once the count reaches zero, after which the scope
@@ -2622,9 +2790,7 @@ public:
 
   token get_token() noexcept { return {this}; }
   void close() noexcept { count_.close(); }
-  auto join() noexcept {
-    return basic_sender{detail::join_descriptor{&count_}};
-  }
+  auto join() noexcept { return basic_sender{detail::desc::join{&count_}}; }
 };
 
 // A simple_counting_scope that can also request stop on its work.
@@ -2638,8 +2804,8 @@ public:
   struct token {
     counting_scope *scope;
     template <sender S> auto wrap(S &&s) const {
-      return detail::append(std::forward<S>(s),
-        detail::stop_when_descriptor{scope->stop_.get_token()});
+      return detail::append(
+        std::forward<S>(s), detail::desc::stop_when{scope->stop_.get_token()});
     }
     bool try_associate() const noexcept {
       return scope->count_.try_associate();
@@ -2650,9 +2816,7 @@ public:
   token get_token() noexcept { return {this}; }
   void close() noexcept { count_.close(); }
   void request_stop() noexcept { stop_.request_stop(); }
-  auto join() noexcept {
-    return basic_sender{detail::join_descriptor{&count_}};
-  }
+  auto join() noexcept { return basic_sender{detail::desc::join{&count_}}; }
 };
 
 // ---- sync_wait ----------------------------------------------------------
@@ -2703,28 +2867,871 @@ template <class Tuple> struct sync_wait_receiver {
 
 // Blocks until s completes, driving a local run_loop. Returns the values, or
 // nullopt if s was stopped; rethrows an error.
-template <sender_in<detail::sync_wait_env> S> auto sync_wait(S &&s) {
-  using values =
-    value_types_of_t<S, detail::sync_wait_env, decayed_tuple, type_list>;
-  static_assert(type_list_size<values>::value == 1,
-    "sync_wait requires exactly one value completion");
-  using tuple_type = typename type_list_at<0, values>::type;
-  detail::sync_wait_state<tuple_type> state;
-  auto op = exec::connect(
-    std::forward<S>(s), detail::sync_wait_receiver<tuple_type>{&state});
-  exec::start(op);
-  state.loop.run();
-  if (state.error)
-    std::rethrow_exception(state.error);
-  return std::move(state.values);
-}
-template <sender S> auto sync_wait_with_variant(S &&s) {
-  return exec::sync_wait(into_variant(std::forward<S>(s)));
-}
+struct sync_wait_t {
+  template <sender_in<detail::sync_wait_env> S> auto operator()(S &&s) const {
+    using values =
+      value_types_of_t<S, detail::sync_wait_env, decayed_tuple, type_list>;
+    static_assert(type_list_size<values>::value == 1,
+      "sync_wait requires exactly one value completion");
+    using tuple_type = typename type_list_at<0, values>::type;
+    detail::sync_wait_state<tuple_type> state;
+    auto op = exec::connect(
+      std::forward<S>(s), detail::sync_wait_receiver<tuple_type>{&state});
+    exec::start(op);
+    state.loop.run();
+    if (state.error)
+      std::rethrow_exception(state.error);
+    return std::move(state.values);
+  }
+};
+struct sync_wait_with_variant_t {
+  template <sender S> auto operator()(S &&s) const {
+    return sync_wait_t{}(into_variant(std::forward<S>(s)));
+  }
+};
+inline constexpr sync_wait_t sync_wait{};
+inline constexpr sync_wait_with_variant_t sync_wait_with_variant{};
 
 namespace this_thread {
 using exec::sync_wait;
 using exec::sync_wait_with_variant;
 } // namespace this_thread
+
+// ---- Coroutines ---------------------------------------------------------
+
+namespace detail {
+// Suspends the coroutine, then calls fn, which may destroy it.
+template <class Fn> struct suspend_then {
+  Fn fn;
+  bool await_ready() const noexcept { return false; }
+  void await_suspend(std::coroutine_handle<>) noexcept { fn(); }
+  [[noreturn]] void await_resume() noexcept { std::terminate(); }
+};
+template <class Fn> suspend_then(Fn) -> suspend_then<Fn>;
+
+// The operation of an awaitable used as a sender: a coroutine, started by
+// start(), that completes the receiver from a suspended state.
+template <class R> class awaitable_operation {
+public:
+  struct promise_type : with_await_transform<promise_type> {
+    R &rcvr;
+    template <class A> promise_type(A &, R &r) noexcept : rcvr(r) {}
+    awaitable_operation get_return_object() noexcept {
+      return awaitable_operation{
+        std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
+    std::suspend_always initial_suspend() noexcept { return {}; }
+    [[noreturn]] std::suspend_always final_suspend() noexcept {
+      std::terminate();
+    }
+    [[noreturn]] void unhandled_exception() noexcept { std::terminate(); }
+    [[noreturn]] void return_void() noexcept { std::terminate(); }
+    std::coroutine_handle<> unhandled_stopped() noexcept {
+      exec::set_stopped(std::move(rcvr));
+      return std::noop_coroutine();
+    }
+    decltype(auto) get_env() const noexcept { return exec::get_env(rcvr); }
+  };
+
+  using operation_state_concept = operation_state_t;
+  awaitable_operation(awaitable_operation &&other) noexcept
+      : handle_(std::exchange(other.handle_, {})) {}
+  ~awaitable_operation() {
+    if (handle_)
+      handle_.destroy();
+  }
+  void start() & noexcept { handle_.resume(); }
+
+private:
+  explicit awaitable_operation(std::coroutine_handle<promise_type> h) noexcept
+      : handle_(h) {}
+  std::coroutine_handle<promise_type> handle_;
+};
+
+template <class A, class R> awaitable_operation<R> connect_awaitable(A a, R r) {
+  using result =
+    await_result_t<A, typename awaitable_operation<R>::promise_type>;
+  std::exception_ptr ep;
+  try {
+    if constexpr (std::is_void_v<result>) {
+      co_await std::move(a);
+      co_await suspend_then{[&]() noexcept { exec::set_value(std::move(r)); }};
+    } else {
+      auto &&v = co_await std::move(a);
+      co_await suspend_then{[&]() noexcept {
+        exec::set_value(std::move(r), std::forward<decltype(v)>(v));
+      }};
+    }
+  } catch (...) {
+    ep = std::current_exception();
+  }
+  co_await suspend_then{
+    [&]() noexcept { exec::set_error(std::move(r), std::move(ep)); }};
+}
+
+// What co_await of a sender produces from its value types: void for none or
+// an empty one, the value for one, a tuple for several.
+template <class Values> struct single_value {};
+template <> struct single_value<type_list<>> {
+  using type = void;
+};
+template <> struct single_value<type_list<std::tuple<>>> {
+  using type = void;
+};
+template <class V> struct single_value<type_list<std::tuple<V>>> {
+  using type = V;
+};
+template <class... Vs> struct single_value<type_list<std::tuple<Vs...>>> {
+  using type = std::tuple<Vs...>;
+};
+
+template <class S, class Promise>
+using await_values_t = value_types_of_t<S, std::decay_t<env_of_t<Promise &>>,
+  decayed_tuple, type_list>;
+
+template <class S, class Promise>
+concept awaitable_sender = sender_in<S, std::decay_t<env_of_t<Promise &>>> &&
+  requires { typename single_value<await_values_t<S, Promise>>::type; } &&
+  requires(Promise &p) {
+    { p.unhandled_stopped() } -> std::convertible_to<std::coroutine_handle<>>;
+  };
+
+// The awaiter whose start() is running on this thread, and the flag that its
+// await_suspend reads afterwards.
+struct starting_awaiter {
+  const void *awaiter = nullptr;
+  bool *completed = nullptr;
+};
+inline thread_local starting_awaiter starting{};
+
+// An operation that can tell which scheduler it completed on (a task's).
+template <class Op, class Sch>
+concept reports_scheduler = requires(const Op &op) {
+  { op.current_scheduler() } -> std::same_as<const Sch &>;
+};
+
+// The awaiter of sender S in a coroutine whose promise is Promise. The
+// operation lives in the awaiter, in the coroutine frame, so co_await does not
+// allocate; the receiver's environment is the promise's. A completion on this
+// thread during start() only sets a flag on await_suspend's stack, which then
+// lets the coroutine continue inline, so the stack does not grow however many
+// such senders it awaits. Any other completion resumes the coroutine where it
+// happens; await_suspend does not touch the awaiter after start(), so that may
+// be before it returns. With Affine, such a completion first schedules onto
+// the promise's scheduler, unless the sender is known to complete there.
+template <class S, class Promise, bool Affine> class sender_awaiter {
+  using env_type = std::decay_t<env_of_t<Promise &>>;
+  static_assert(type_list_size<await_values_t<S, Promise>>::value <= 1,
+    "co_await requires a sender with at most one value completion; use "
+    "into_variant");
+  using value_type = typename single_value<await_values_t<S, Promise>>::type;
+  using stored_type =
+    std::conditional_t<std::is_void_v<value_type>, std::monostate, value_type>;
+
+  struct receiver {
+    using receiver_concept = receiver_t;
+    sender_awaiter *self;
+    template <class... Vs> void set_value(Vs &&...vs) && noexcept {
+      try {
+        self->result.template emplace<1>(std::forward<Vs>(vs)...);
+      } catch (...) {
+        self->result.template emplace<2>(std::current_exception());
+      }
+      self->arrive();
+    }
+    template <class E> void set_error(E &&e) && noexcept {
+      self->result.template emplace<2>(as_exception_ptr(std::forward<E>(e)));
+      self->arrive();
+    }
+    void set_stopped() && noexcept { self->arrive(); }
+    env_type get_env() const noexcept { return exec::get_env(self->promise); }
+  };
+
+  struct no_hop {};
+  // Scheduling back onto the promise's scheduler. Only used with Affine.
+  struct hop {
+    using scheduler_type =
+      std::decay_t<decltype(get_scheduler(std::declval<const env_type &>()))>;
+    struct resume_receiver {
+      using receiver_concept = receiver_t;
+      sender_awaiter *self;
+      void set_value() && noexcept { self->handle.resume(); }
+      template <class E> void set_error(E &&e) && noexcept {
+        self->result.template emplace<2>(as_exception_ptr(std::forward<E>(e)));
+        self->handle.resume();
+      }
+      void set_stopped() && noexcept {
+        self->promise.unhandled_stopped().resume();
+      }
+      env_type get_env() const noexcept { return exec::get_env(self->promise); }
+    };
+    struct operation {
+      scheduler_type sch;
+      connect_result_t<schedule_result_t<scheduler_type &>, resume_receiver> op;
+      operation(scheduler_type s, resume_receiver r)
+          : sch(std::move(s)), op(exec::connect(exec::schedule(sch), r)) {}
+    };
+    std::optional<operation> op;
+  };
+  using op_type = connect_result_t<S, receiver>;
+
+  Promise &promise;
+  std::coroutine_handle<Promise> handle;
+  // Still monostate after the completion: stopped.
+  std::variant<std::monostate, stored_type, std::exception_ptr> result;
+  bool sends_on_scheduler; // S reports the promise's scheduler
+  [[no_unique_address]] std::conditional_t<Affine, hop, no_hop> back;
+  op_type op;
+
+  static bool completes_on(
+    [[maybe_unused]] const S &s, [[maybe_unused]] const Promise &p) noexcept {
+    if constexpr (Affine) {
+      using sch_type = typename hop::scheduler_type;
+      if constexpr (requires {
+                      {
+                        get_completion_scheduler<set_value_t>(exec::get_env(s))
+                      } -> std::same_as<sch_type>;
+                    })
+        return get_completion_scheduler<set_value_t>(exec::get_env(s)) ==
+          get_scheduler(exec::get_env(p));
+    }
+    return false;
+  }
+
+  bool on_scheduler() const noexcept {
+    if constexpr (reports_scheduler<op_type, typename hop::scheduler_type>)
+      if (op.current_scheduler() == get_scheduler(exec::get_env(promise)))
+        return true;
+    return sends_on_scheduler;
+  }
+
+  void arrive() noexcept {
+    if (starting.awaiter == this)
+      *starting.completed = true;
+    else
+      resume();
+  }
+
+  // Continues the coroutine after a completion outside start().
+  void resume() noexcept {
+    if (result.index() == 0) {
+      promise.unhandled_stopped().resume();
+      return;
+    }
+    if constexpr (Affine) {
+      if (!on_scheduler()) {
+        try {
+          back.op.emplace(get_scheduler(exec::get_env(promise)),
+            typename hop::resume_receiver{this});
+        } catch (...) {
+          result.template emplace<2>(std::current_exception());
+          handle.resume();
+          return;
+        }
+        exec::start(back.op->op);
+        return;
+      }
+    }
+    handle.resume();
+  }
+
+public:
+  sender_awaiter(S &&s, Promise &p)
+      : promise(p), sends_on_scheduler(completes_on(s, p)),
+        op(exec::connect(std::forward<S>(s), receiver{this})) {}
+  sender_awaiter(sender_awaiter &&) = delete;
+
+  bool await_ready() const noexcept { return false; }
+  bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
+    handle = h;
+    bool completed = false;
+    starting_awaiter outer = std::exchange(starting, {this, &completed});
+    exec::start(op);
+    starting = outer;
+    if (!completed)
+      return true; // The completion resumes the coroutine, maybe already has.
+    if (result.index() == 0) {
+      promise.unhandled_stopped().resume();
+      return true;
+    }
+    return false;
+  }
+  value_type await_resume() {
+    if (result.index() == 2)
+      std::rethrow_exception(std::get<2>(result));
+    if constexpr (!std::is_void_v<value_type>)
+      return std::move(std::get<1>(result));
+  }
+};
+
+template <bool Affine, class S, class Promise>
+auto await_sender(S &&s, Promise &p) {
+  return sender_awaiter<S, Promise, Affine>(std::forward<S>(s), p);
+}
+} // namespace detail
+
+// What co_await e awaits in a coroutine with promise p: e.as_awaitable(p), an
+// awaitable as is, or a sender with at most one value completion through an
+// awaiter; set_error rethrows the error as an exception, and set_stopped calls
+// p.unhandled_stopped().
+struct as_awaitable_t {
+  template <class Expr, class Promise>
+  decltype(auto) operator()(Expr &&e, Promise &p) const {
+    if constexpr (requires { std::forward<Expr>(e).as_awaitable(p); })
+      return std::forward<Expr>(e).as_awaitable(p);
+    else if constexpr (detail::is_awaitable<Expr, detail::plain_promise>)
+      return std::forward<Expr>(e);
+    else if constexpr (detail::awaitable_sender<Expr, Promise>)
+      return detail::await_sender<false>(std::forward<Expr>(e), p);
+    else
+      return std::forward<Expr>(e);
+  }
+};
+inline constexpr as_awaitable_t as_awaitable{};
+
+// A base for promise types: co_await works on senders, and a stopped sender
+// stops the awaiting coroutine (see set_continuation).
+template <class Promise> class with_awaitable_senders {
+  [[noreturn]] static std::coroutine_handle<> no_stopped_handler(
+    void *) noexcept {
+    std::terminate();
+  }
+  std::coroutine_handle<> continuation_{};
+  std::coroutine_handle<> (*stopped_)(void *) noexcept = &no_stopped_handler;
+
+public:
+  // h is resumed when this coroutine finishes; a stop goes to h's promise.
+  template <class OtherPromise>
+    requires(!std::is_void_v<OtherPromise>)
+  void set_continuation(std::coroutine_handle<OtherPromise> h) noexcept {
+    continuation_ = h;
+    if constexpr (requires(OtherPromise &other) { other.unhandled_stopped(); })
+      stopped_ = [](void *address) noexcept -> std::coroutine_handle<> {
+        return std::coroutine_handle<OtherPromise>::from_address(address)
+          .promise()
+          .unhandled_stopped();
+      };
+    else
+      stopped_ = &no_stopped_handler;
+  }
+  std::coroutine_handle<> continuation() const noexcept {
+    return continuation_;
+  }
+  std::coroutine_handle<> unhandled_stopped() noexcept {
+    return stopped_(continuation_.address());
+  }
+  template <class Value> decltype(auto) await_transform(Value &&value) {
+    return as_awaitable(
+      std::forward<Value>(value), static_cast<Promise &>(*this));
+  }
+};
+
+// ---- task_scheduler, affine_on ------------------------------------------
+
+namespace detail {
+// The receiving end of a task_scheduler's wrapped schedule operation.
+struct schedule_sink {
+  inplace_stop_token token;
+  virtual void set_value() noexcept = 0;
+  virtual void set_error(std::exception_ptr) noexcept = 0;
+  virtual void set_stopped() noexcept = 0;
+
+protected:
+  ~schedule_sink() = default;
+};
+
+struct sink_receiver {
+  using receiver_concept = receiver_t;
+  schedule_sink *sink;
+  void set_value() && noexcept { sink->set_value(); }
+  template <class E> void set_error(E &&e) && noexcept {
+    sink->set_error(as_exception_ptr(std::forward<E>(e)));
+  }
+  void set_stopped() && noexcept { sink->set_stopped(); }
+  prop<get_stop_token_t, inplace_stop_token> get_env() const noexcept {
+    return {{}, sink->token};
+  }
+};
+
+struct erased_operation {
+  virtual ~erased_operation() = default;
+  virtual void start() noexcept = 0;
+};
+
+namespace desc {
+// Connects the wrapped scheduler's schedule sender on the heap. A stop token
+// of the receiver reaches it if it is an inplace_stop_token. Sch is
+// task_scheduler, which is still incomplete here.
+template <class Sch> struct task_schedule {
+  Sch sch;
+  static constexpr bool is_source = true;
+  template <class, class>
+  using completions = completion_signatures<set_value_t(),
+    set_error_t(std::exception_ptr), set_stopped_t()>;
+  sched_attrs<Sch> attrs() const noexcept { return {sch}; }
+  template <class T, class In> struct apply : layer<T, apply<T, In>> {
+    using base = layer<T, apply<T, In>>;
+    struct relay final : schedule_sink {
+      apply *self;
+      explicit relay(apply *a) noexcept : self(a) {}
+      void set_value() noexcept override { self->pass(set_value_t{}); }
+      void set_error(std::exception_ptr e) noexcept override {
+        self->pass(set_error_t{}, std::move(e));
+      }
+      void set_stopped() noexcept override { self->pass(set_stopped_t{}); }
+    };
+    relay sink;
+    std::unique_ptr<erased_operation> op;
+    template <class... Rest>
+    apply(task_schedule d, Rest &&...rest)
+        : base{std::forward<Rest>(rest)...}, sink(this),
+          op(d.sch.connect(sink)) {}
+    void start() noexcept {
+      using token = stop_token_of_t<decltype(this->downstream_env())>;
+      if constexpr (std::is_same_v<token, inplace_stop_token>)
+        sink.token = get_stop_token(this->downstream_env());
+      op->start();
+    }
+  };
+};
+} // namespace desc
+} // namespace detail
+
+// A scheduler of any type behind one type, shared by copies. Each schedule
+// operation connects the wrapped scheduler's on the heap.
+class task_scheduler {
+  struct model_base {
+    virtual ~model_base() = default;
+    virtual std::unique_ptr<detail::erased_operation> connect(
+      detail::schedule_sink &) const = 0;
+    virtual bool equals(const model_base &) const noexcept = 0;
+  };
+  template <class Sch> struct model final : model_base {
+    Sch sch;
+    struct operation final : detail::erased_operation {
+      connect_result_t<schedule_result_t<const Sch &>, detail::sink_receiver>
+        op;
+      operation(const Sch &sch, detail::schedule_sink &sink)
+          : op(exec::connect(
+              exec::schedule(sch), detail::sink_receiver{&sink})) {}
+      void start() noexcept override { exec::start(op); }
+    };
+    explicit model(Sch s) : sch(std::move(s)) {}
+    std::unique_ptr<detail::erased_operation> connect(
+      detail::schedule_sink &sink) const override {
+      return std::make_unique<operation>(sch, sink);
+    }
+    bool equals(const model_base &other) const noexcept override {
+      auto *m = dynamic_cast<const model *>(&other);
+      return m && m->sch == sch;
+    }
+  };
+
+  std::shared_ptr<const model_base> sch_;
+  template <class> friend struct detail::desc::task_schedule;
+  std::unique_ptr<detail::erased_operation> connect(
+    detail::schedule_sink &sink) const {
+    return sch_->connect(sink);
+  }
+
+public:
+  using scheduler_concept = scheduler_t;
+  template <class Sch>
+    requires(!std::is_same_v<std::remove_cvref_t<Sch>, task_scheduler> &&
+      scheduler<Sch>)
+  explicit task_scheduler(Sch &&sch)
+      : sch_(std::make_shared<const model<std::remove_cvref_t<Sch>>>(
+          std::forward<Sch>(sch))) {}
+  auto schedule() const noexcept {
+    return basic_sender{detail::desc::task_schedule<task_scheduler>{*this}};
+  }
+  friend bool operator==(
+    const task_scheduler &a, const task_scheduler &b) noexcept {
+    return a.sch_ == b.sch_ || a.sch_->equals(*b.sch_);
+  }
+};
+
+// Completes s on sch. inline_scheduler leaves s as it is.
+struct affine_on_t : detail::adaptor<affine_on_t> {
+  using adaptor::operator();
+  template <sender S, scheduler Sch> auto operator()(S &&s, Sch sch) const {
+    if constexpr (std::is_same_v<Sch, inline_scheduler>)
+      return std::remove_cvref_t<S>(std::forward<S>(s));
+    else
+      return continues_on(std::forward<S>(s), std::move(sch));
+  }
+};
+inline constexpr affine_on_t affine_on{};
+
+// ---- task ---------------------------------------------------------------
+
+// co_yield with_error{e} completes the task with set_error(e).
+template <class E> struct with_error {
+  using type = std::remove_cvref_t<E>;
+  type error;
+};
+template <class E> with_error(E) -> with_error<E>;
+
+// co_await change_coroutine_scheduler{sch} moves the task onto sch, which it
+// uses from then on, and returns the previous scheduler.
+template <class Sch> struct change_coroutine_scheduler {
+  using type = std::remove_cvref_t<Sch>;
+  type scheduler;
+};
+template <class Sch>
+change_coroutine_scheduler(Sch) -> change_coroutine_scheduler<Sch>;
+
+namespace detail {
+template <class T> struct is_change_scheduler : std::false_type {};
+template <class Sch>
+struct is_change_scheduler<change_coroutine_scheduler<Sch>> : std::true_type {};
+
+// Env::name if Get<Env> names a type, else Default.
+template <template <class> class Get, class Env, class Default>
+struct member_type_or {
+  using type = Default;
+};
+template <template <class> class Get, class Env, class Default>
+  requires requires { typename Get<Env>; }
+struct member_type_or<Get, Env, Default> {
+  using type = Get<Env>;
+};
+template <class E> using scheduler_type_of = typename E::scheduler_type;
+template <class E> using allocator_type_of = typename E::allocator_type;
+template <class E> using stop_source_type_of = typename E::stop_source_type;
+template <class E> using error_types_of = typename E::error_types;
+
+// The allocator after the first allocator_arg among a coroutine's
+// parameters, or a default one.
+template <class Alloc> Alloc find_allocator() { return Alloc(); }
+template <class Alloc, class A> Alloc find_allocator(const A &) {
+  return Alloc();
+}
+template <class Alloc, class A, class B, class... Rest>
+Alloc find_allocator(const A &, const B &b, const Rest &...rest) {
+  if constexpr (std::is_same_v<A, std::allocator_arg_t>)
+    return Alloc(b);
+  else
+    return find_allocator<Alloc>(b, rest...);
+}
+
+// Coroutine frames allocated with Alloc. A copy of the allocator is kept
+// after the frame unless any default one can free it.
+template <class Alloc> struct frame_allocation {
+  struct alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) block {
+    std::byte bytes[__STDCPP_DEFAULT_NEW_ALIGNMENT__];
+  };
+  using block_alloc =
+    typename std::allocator_traits<Alloc>::template rebind_alloc<block>;
+  using traits = std::allocator_traits<block_alloc>;
+  static constexpr bool stored = !(traits::is_always_equal::value &&
+    std::is_default_constructible_v<block_alloc>);
+
+  static std::size_t offset(std::size_t n) noexcept {
+    constexpr std::size_t a = alignof(block_alloc);
+    return (n + a - 1) / a * a;
+  }
+  static std::size_t blocks(std::size_t n) noexcept {
+    std::size_t bytes = stored ? offset(n) + sizeof(block_alloc) : n;
+    return (bytes + sizeof(block) - 1) / sizeof(block);
+  }
+  static void *allocate(std::size_t n, const Alloc &alloc) {
+    block_alloc a(alloc);
+    void *p = traits::allocate(a, blocks(n));
+    if constexpr (stored)
+      ::new (static_cast<std::byte *>(p) + offset(n)) block_alloc(std::move(a));
+    return p;
+  }
+  static void deallocate(void *p, std::size_t n) noexcept {
+    if constexpr (stored) {
+      auto *kept = std::launder(reinterpret_cast<block_alloc *>(
+        static_cast<std::byte *>(p) + offset(n)));
+      block_alloc a(std::move(*kept));
+      kept->~block_alloc();
+      traits::deallocate(a, static_cast<block *>(p), blocks(n));
+    } else {
+      block_alloc a;
+      traits::deallocate(a, static_cast<block *>(p), blocks(n));
+    }
+  }
+};
+
+// Where a task delivers its completion; the result is in its promise. Each
+// returns the coroutine to resume next.
+struct task_continuation {
+  std::coroutine_handle<> (*complete)(task_continuation &) noexcept;
+  std::coroutine_handle<> (*stopped)(task_continuation &) noexcept;
+};
+
+template <class T> struct task_value {
+  T value;
+};
+template <> struct task_value<void> {};
+
+// return_value or return_void, storing into result.
+template <class T, class Result> struct task_result {
+  Result result;
+  template <class V = T> void return_value(V &&v) {
+    result.template emplace<task_value<T>>(std::forward<V>(v));
+  }
+};
+template <class Result> struct task_result<void, Result> {
+  Result result;
+  void return_void() noexcept { result.template emplace<task_value<void>>(); }
+};
+} // namespace detail
+
+// A lazy coroutine sender. Environment may define scheduler_type (default
+// task_scheduler), allocator_type (std::allocator<std::byte>),
+// stop_source_type (inplace_stop_source) and error_types
+// (completion_signatures<set_error_t(std::exception_ptr)>).
+//
+// Started, the task runs inline until its first suspension. It takes its
+// scheduler from the receiver's environment, and after a co_await of a
+// sender that completed later, it resumes on that scheduler; a sender that
+// completed during start() resumes it inline. A stopped sender stops the
+// task. Its environment answers get_scheduler, get_stop_token (the
+// receiver's) and get_allocator (the one after std::allocator_arg among the
+// coroutine's parameters).
+template <class T = void, class Environment = env<>> class task {
+public:
+  using sender_concept = sender_t;
+  using scheduler_type =
+    typename detail::member_type_or<detail::scheduler_type_of, Environment,
+      task_scheduler>::type;
+  using allocator_type =
+    typename detail::member_type_or<detail::allocator_type_of, Environment,
+      std::allocator<std::byte>>::type;
+  using stop_source_type =
+    typename detail::member_type_or<detail::stop_source_type_of, Environment,
+      inplace_stop_source>::type;
+  using stop_token_type =
+    decltype(std::declval<const stop_source_type &>().get_token());
+  using error_types = typename detail::member_type_or<detail::error_types_of,
+    Environment, type_list<set_error_t(std::exception_ptr)>>::type;
+  using completion_signatures =
+    detail::concat_sigs_t<type_list<typename detail::value_sig<T>::type>,
+      error_types, type_list<set_stopped_t()>>;
+
+  template <class R> class state;
+  class promise_type;
+
+  task(task &&other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+  ~task() {
+    if (handle_)
+      handle_.destroy();
+  }
+
+  template <receiver R> state<R> connect(R r) && {
+    static_assert(receiver_of<R, completion_signatures>,
+      "connect: the receiver does not accept every completion of the task");
+    return state<R>(std::exchange(handle_, {}), std::move(r));
+  }
+
+private:
+  template <class E>
+  static constexpr bool has_error = std::is_same_v<
+    detail::concat_sigs_t<error_types, type_list<set_error_t(E)>>, error_types>;
+  template <class... Es>
+  using result_variant =
+    std::variant<std::monostate, detail::task_value<T>, Es...>;
+  using result_type = detail::gather_signatures_t<set_error_t, error_types,
+    detail::single_t, result_variant>;
+
+  explicit task(std::coroutine_handle<promise_type> h) noexcept : handle_(h) {}
+  std::coroutine_handle<promise_type> handle_;
+};
+
+template <class T, class Environment>
+class task<T, Environment>::promise_type
+    : public detail::task_result<T, result_type> {
+  static constexpr bool affine =
+    !std::is_same_v<scheduler_type, inline_scheduler>;
+  using frames = detail::frame_allocation<allocator_type>;
+
+  struct completion {
+    bool await_ready() const noexcept { return false; }
+    std::coroutine_handle<> await_suspend(
+      std::coroutine_handle<promise_type> h) noexcept {
+      auto &c = *h.promise().continuation_;
+      return c.complete(c);
+    }
+    void await_resume() const noexcept {}
+  };
+
+  struct env_type {
+    const promise_type *p;
+    scheduler_type query(get_scheduler_t) const noexcept { return *p->sch_; }
+    stop_token_type query(get_stop_token_t) const noexcept { return p->token_; }
+    allocator_type query(get_allocator_t) const noexcept { return p->alloc_; }
+  };
+
+  detail::task_continuation *continuation_ = nullptr;
+  std::optional<scheduler_type> sch_;
+  stop_token_type token_;
+  [[no_unique_address]] allocator_type alloc_;
+  template <class> friend class state;
+
+public:
+  template <class... Args>
+  promise_type(const Args &...args)
+      : alloc_(detail::find_allocator<allocator_type>(args...)) {}
+
+  template <class... Args>
+  static void *operator new(std::size_t n, const Args &...args) {
+    return frames::allocate(n, detail::find_allocator<allocator_type>(args...));
+  }
+  static void operator delete(void *p, std::size_t n) noexcept {
+    frames::deallocate(p, n);
+  }
+
+  task get_return_object() noexcept {
+    return task(std::coroutine_handle<promise_type>::from_promise(*this));
+  }
+  std::suspend_always initial_suspend() noexcept { return {}; }
+  completion final_suspend() noexcept { return {}; }
+  void unhandled_exception() noexcept {
+    if constexpr (has_error<std::exception_ptr>)
+      this->result.template emplace<std::exception_ptr>(
+        std::current_exception());
+    else
+      std::terminate();
+  }
+  std::coroutine_handle<> unhandled_stopped() noexcept {
+    return continuation_->stopped(*continuation_);
+  }
+  template <class E> completion yield_value(with_error<E> e) {
+    static_assert(has_error<typename with_error<E>::type>,
+      "with_error: the error type is not in the task's error_types");
+    this->result.template emplace<typename with_error<E>::type>(
+      std::move(e.error));
+    return {};
+  }
+
+  template <class A> decltype(auto) await_transform(A &&a) {
+    if constexpr (detail::is_change_scheduler<std::remove_cvref_t<A>>::value) {
+      scheduler_type old =
+        std::exchange(*sch_, scheduler_type(std::forward<A>(a).scheduler));
+      return detail::await_sender<false>(
+        then(exec::schedule(*sch_),
+          [old = std::move(old)]() mutable noexcept { return std::move(old); }),
+        *this);
+    } else if constexpr (requires { std::forward<A>(a).as_awaitable(*this); }) {
+      return std::forward<A>(a).as_awaitable(*this);
+    } else {
+      return detail::await_sender<affine>(std::forward<A>(a), *this);
+    }
+  }
+
+  env_type get_env() const noexcept { return {this}; }
+};
+
+// The operation of a connected task. It owns the coroutine.
+template <class T, class Environment>
+template <class R>
+class task<T, Environment>::state : detail::task_continuation {
+  using rcvr_token = stop_token_of_t<env_of_t<R>>;
+  // The receiver's stop token is used as is if it has the task's type.
+  // Otherwise a stop request on it is forwarded to a source of the task's.
+  static constexpr bool own_stop =
+    !std::is_same_v<rcvr_token, stop_token_type> &&
+    !unstoppable_token<rcvr_token>;
+  struct forward {
+    stop_source_type *source;
+    void operator()() noexcept { source->request_stop(); }
+  };
+  struct stop_bridge {
+    stop_source_type source;
+    std::optional<stop_callback_for_t<rcvr_token, forward>> callback;
+  };
+  struct no_bridge {};
+
+  std::coroutine_handle<promise_type> handle_;
+  R rcvr_;
+  [[no_unique_address]] std::conditional_t<own_stop, stop_bridge, no_bridge>
+    stop_;
+
+  void stop_forwarding() noexcept {
+    if constexpr (own_stop)
+      stop_.callback.reset();
+  }
+
+  static std::coroutine_handle<> complete(
+    detail::task_continuation &c) noexcept {
+    auto &self = static_cast<state &>(c);
+    self.stop_forwarding();
+    auto &result = self.handle_.promise().result;
+    if (result.index() == 1) {
+      if constexpr (std::is_void_v<T>)
+        exec::set_value(std::move(self.rcvr_));
+      else
+        exec::set_value(
+          std::move(self.rcvr_), std::move(std::get<1>(result).value));
+    } else {
+      std::visit(
+        [&self](auto &e) noexcept {
+          using E = std::decay_t<decltype(e)>;
+          if constexpr (!std::is_same_v<E, std::monostate> &&
+            !std::is_same_v<E, detail::task_value<T>>)
+            exec::set_error(std::move(self.rcvr_), std::move(e));
+        },
+        result);
+    }
+    return std::noop_coroutine();
+  }
+  static std::coroutine_handle<> stopped(
+    detail::task_continuation &c) noexcept {
+    auto &self = static_cast<state &>(c);
+    self.stop_forwarding();
+    exec::set_stopped(std::move(self.rcvr_));
+    return std::noop_coroutine();
+  }
+
+public:
+  using operation_state_concept = operation_state_t;
+
+  state(std::coroutine_handle<promise_type> h, R r)
+      : detail::task_continuation{&complete, &stopped}, handle_(h),
+        rcvr_(std::move(r)) {
+    auto &p = handle_.promise();
+    p.continuation_ = this;
+    try {
+      auto env = exec::get_env(rcvr_);
+      if constexpr (requires { scheduler_type(get_scheduler(env)); })
+        p.sch_.emplace(get_scheduler(env));
+      else if constexpr (std::is_default_constructible_v<scheduler_type>)
+        p.sch_.emplace();
+      else if constexpr (std::is_constructible_v<scheduler_type,
+                           inline_scheduler>)
+        p.sch_.emplace(inline_scheduler{});
+      else
+        static_assert(std::is_void_v<R>,
+          "task: the receiver's environment has no scheduler of "
+          "scheduler_type");
+    } catch (...) {
+      handle_.destroy();
+      throw;
+    }
+  }
+  state(state &&) = delete;
+  ~state() { handle_.destroy(); }
+
+  void start() & noexcept {
+    auto &p = handle_.promise();
+    if constexpr (own_stop) {
+      stop_.callback.emplace(
+        get_stop_token(exec::get_env(rcvr_)), forward{&stop_.source});
+      p.token_ = stop_.source.get_token();
+    } else if constexpr (!unstoppable_token<rcvr_token>) {
+      p.token_ = get_stop_token(exec::get_env(rcvr_));
+    }
+    handle_.resume();
+  }
+
+  // The scheduler the task runs on now, and completes on.
+  const scheduler_type &current_scheduler() const noexcept {
+    return *handle_.promise().sch_;
+  }
+};
 
 } // namespace sg::exec
