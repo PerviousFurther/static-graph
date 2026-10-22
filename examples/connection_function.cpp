@@ -1,5 +1,5 @@
 // A connection state can expose a function that configures its owning node.
-#include "../inc/graph.hpp"
+#include <sg/core/graph.hpp>
 
 #include <cassert>
 

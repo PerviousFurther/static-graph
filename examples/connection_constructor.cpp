@@ -1,7 +1,7 @@
 // A connection state can inject constructor arguments into earlier layers.
 // This example's injecting descriptor goes immediately after its connection,
 // which itself goes immediately after a parameter_node.
-#include "../inc/graph.hpp"
+#include <sg/core/graph.hpp>
 
 #include <cassert>
 

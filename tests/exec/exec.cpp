@@ -1,7 +1,7 @@
 // Sender/receiver example on inc/exec.hpp.
-// Build: g++ -std=c++20 -O2 -pthread -I inc example/exec.cpp -o exec
+// Build: g++ -std=c++20 -O2 -pthread -I inc tests/exec/exec.cpp -o exec
 
-#include "exec.hpp"
+#include <sg/exec/exec.hpp>
 
 #include <chrono>
 #include <cstdio>

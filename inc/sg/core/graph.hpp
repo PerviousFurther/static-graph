@@ -56,23 +56,90 @@ struct type_bind_back {
   template <typename... As> using apply = F<As..., Bs...>;
 };
 
-// Applies descriptors in order: apply_each_t<T, A, B> is
-// B::apply<A::apply<T>>.
-template <typename T, typename... Ds> struct apply_each {
-  using type = T;
+namespace detail {
+template <typename X, typename List> struct type_list_contains;
+template <typename X, typename... Ts>
+struct type_list_contains<X, type_list<Ts...>>
+    : std::bool_constant<(std::is_same_v<X, Ts> || ...)> {};
+
+// Mixins a descriptor stacks on, declared as `using inherit = type_list<...>`
+// so that they are known before any apply is instantiated.
+template <typename D> struct inherit_of {
+  using type = type_list<>;
 };
-template <typename T, typename D, typename... Ds>
-struct apply_each<T, D, Ds...>
-    : apply_each<typename D::template apply<T>, Ds...> {};
-template <typename T, typename... Ds>
-using apply_each_t = typename apply_each<T, Ds...>::type;
+template <typename D>
+  requires requires { typename D::inherit; }
+struct inherit_of<D> {
+  using type = typename D::inherit;
+};
+
+// D's inherited mixins, depth first, then D itself. Path holds the mixins
+// being expanded; meeting one again is a cycle.
+template <typename D, typename Path,
+  bool Cyclic = type_list_contains<D, Path>::value>
+struct expand {
+  static_assert(!Cyclic, "apply_each: cyclic inherit");
+  using type = type_list<>;
+};
+template <typename List, typename Path> struct expand_list;
+template <typename... Ds, typename Path>
+struct expand_list<type_list<Ds...>, Path> {
+  using type = typename type_list_cat<typename expand<Ds, Path>::type...>::type;
+};
+template <typename D, typename Path> struct expand<D, Path, false> {
+  using type = typename type_list_cat<
+    typename expand_list<typename inherit_of<D>::type,
+      typename type_list_cat<Path, type_list<D>>::type>::type,
+    type_list<D>>::type;
+};
+
+// Folds D::apply over an expanded list. Done lists the mixins applied so
+// far; a mixin in Done is skipped and its apply never instantiated.
+template <typename Base, typename Done, typename List> struct apply_list {
+  using type = Base;
+  using done = Done;
+};
+template <typename Base, typename Done, typename D, typename... Ds>
+struct apply_list<Base, Done, type_list<D, Ds...>>
+    : apply_list<Base, Done, type_list<Ds...>> {};
+template <typename Base, typename... Done, typename D, typename... Ds>
+  requires(!(std::is_same_v<D, Done> || ...))
+struct apply_list<Base, type_list<Done...>, type_list<D, Ds...>>
+    : apply_list<typename D::template apply<Base>, type_list<Done..., D>,
+        type_list<Ds...>> {};
+template <typename Base, typename... Ds>
+using apply_each_of = apply_list<Base, type_list<>,
+  typename type_list_cat<typename expand<Ds, type_list<>>::type...>::type>;
+
+// Stacks Ds::apply on Base in order, without expanding or skipping: a graph
+// may repeat a node or state descriptor.
+template <typename Base, typename... Ds> struct stack {
+  using type = Base;
+};
+template <typename Base, typename D, typename... Ds>
+struct stack<Base, D, Ds...> : stack<typename D::template apply<Base>, Ds...> {
+};
+} // namespace detail
+
+// Inherits Ds::apply stacked on Base in order: apply_each<B, X, Y> derives
+// from Y::apply<X::apply<B>>. A mixin lists the mixins it needs in
+// `using inherit = type_list<...>`; they are applied before it. Each mixin is
+// applied once per apply_each, and `dependencies` lists the applied mixins in
+// order.
+template <typename Base, typename... Ds>
+struct apply_each : detail::apply_each_of<Base, Ds...>::type {
+  using detail::apply_each_of<Base, Ds...>::type::type;
+  using dependencies = typename detail::apply_each_of<Base, Ds...>::done;
+};
 
 // Derived is optional: node{} remains a no-op node.
+// Members a graph calls per node take std::in_place_index_t<node_index>
+// first. Every node in the chain then has its own overload, and a node without
+// one has none: an earlier node's never matches its index.
 // A custom node should use base node::apply<T, apply<T>> so get_node returns
 // the concrete node layer.
 struct node {
   template <typename T, typename Derived = void> struct apply : T {
-    using node_tag = void;
     using self_type =
       std::conditional_t<std::is_void_v<Derived>, apply, Derived>;
 
@@ -81,11 +148,18 @@ struct node {
     template <typename... Args>
     constexpr apply(Args &&...args) : T{std::forward<Args>(args)...} {}
 
-    template <typename... Args>
-    constexpr void execute(Args &&...) const noexcept {}
-
   protected:
     using T::get_node;
+
+    // The node that owns the current layer: layers stacked above this node,
+    // including its states and connections, reach the concrete node here.
+    using this_node_type = self_type;
+    constexpr self_type *get_this_node() noexcept {
+      return static_cast<self_type *>(this);
+    }
+    constexpr const self_type *get_this_node() const noexcept {
+      return static_cast<const self_type *>(this);
+    }
 
     static constexpr std::size_t node_index = []() constexpr {
       if constexpr (requires { T::node_index; })
@@ -109,6 +183,7 @@ struct node {
 // Forward references are allowed; dag checks the complete graph.
 template <std::size_t... indices> struct connection {
   template <typename T> struct apply : T {
+
     template <typename... Args>
     constexpr apply(connection, Args &&...args)
         : T{std::forward<Args>(args)...} {}
@@ -334,8 +409,9 @@ using make_reverse_index_sequence =
 
 // The first descriptor is applied first, so it is the innermost base; the
 // constructor receives the outermost descriptor's argument first.
-template <typename... Ts> struct graph : apply_each_t<detail::root, Ts...> {
-  using base = apply_each_t<detail::root, Ts...>;
+template <typename... Ts>
+struct graph : detail::stack<detail::root, Ts...>::type {
+  using base = typename detail::stack<detail::root, Ts...>::type;
 
 private:
   template <std::size_t... Is, typename Tuple>
@@ -432,10 +508,6 @@ public:
     return base::get_connection_state(
       std::in_place_index<N>, std::in_place_index<C>, std::in_place_index<S>);
   }
-
-private:
-  // Do not accidentally expose execute inherited from the last node layer.
-  void execute(...) const = delete;
 };
 template <typename... Ts> graph(Ts &&...) -> graph<std::remove_cvref_t<Ts>...>;
 

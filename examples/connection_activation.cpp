@@ -1,7 +1,7 @@
-// Activation is an application policy, independent of exec_graph's scheduler.
+// Activation is an application policy, independent of dag's scheduler.
 // Here an external selector visits the states of one connection; each state
 // owns its payload and decides how to react.
-#include "../inc/graph.hpp"
+#include <sg/core/dag.hpp>
 
 #include <cassert>
 
@@ -24,28 +24,14 @@ struct activation_state {
   };
 };
 
-template <std::size_t N, std::size_t C, typename G, std::size_t... Ss>
-constexpr void activate_states(G &g, int &output, std::index_sequence<Ss...>) {
-  (g.template get_connection_state<N, C, Ss>()->activate(output), ...);
-}
-
-template <std::size_t N, typename G, std::size_t... Cs>
-constexpr bool select_connection(
-  G &g, std::size_t current, int &output, std::index_sequence<Cs...>) {
-  // A runtime index dispatches to compile-time state lookups. No match means
-  // no side effects; only the selected connection's states are activated.
-  return ((current == Cs &&
-            (activate_states<N, Cs>(g, output,
-               std::make_index_sequence<
-                 G::template get_connection_state_count<N, Cs>()>{}),
-              true)) ||
-    ...);
-}
-
+// A runtime index dispatches to compile-time state lookups. No match means
+// no side effects; only the selected connection's states are activated.
 template <std::size_t N, typename G>
 constexpr bool set_current_connection(G &g, std::size_t current, int &output) {
-  return select_connection<N>(g, current, output,
-    std::make_index_sequence<G::template get_connection_count<N>()>{});
+  return sg::node_context<N, G>{g}.visit_connection(
+    current, [&](auto, auto states) {
+      std::apply([&](auto &...s) { (s.activate(output), ...); }, states);
+    });
 }
 
 constexpr bool test_activation() {
